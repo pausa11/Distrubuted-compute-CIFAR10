@@ -22,6 +22,21 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+batch_manager = None
+model = None
+
+def ensure_initialized():
+    global batch_manager, model
+    if model is None:
+        model = SmallCIFAR().to(torch.device("cpu"))
+    if batch_manager is None:
+        # Importar torchvision solo cuando haga falta (menos RAM en frío)
+        import torchvision
+        import torchvision.transforms as T
+        data_root = os.environ.get('DATA_ROOT', '/tmp/torch-datasets')
+        batch_manager = BatchManager(data_root)
+
+
 # ====== Modelo ======
 class SmallCIFAR(nn.Module):
     def __init__(self, num_classes=10):
@@ -101,6 +116,7 @@ def set_seed(seed: int = 1337):
 
 @torch.no_grad()
 def evaluate_batch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    ensure_initialized()
     """Evalúa el modelo en un batch específico"""
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -182,11 +198,13 @@ def initialize_components():
 # ====== API Endpoints ======
 @app.route('/health', methods=['GET'])
 def health_check():
+    ensure_initialized()
     """Health check endpoint"""
     return jsonify({"status": "healthy", "message": "Node is running"}), 200
 
 @app.route('/info', methods=['GET'])
 def get_info():
+    ensure_initialized()
     """Información del nodo"""
     return jsonify({
         "device": "cpu",
@@ -197,6 +215,7 @@ def get_info():
 
 @app.route('/train_batch', methods=['POST'])
 def train_batch_endpoint():
+    ensure_initialized()
     """Endpoint principal para entrenar un batch específico"""
     try:
         data = request.get_json()
@@ -273,6 +292,7 @@ def train_batch_endpoint():
 
 @app.route('/evaluate', methods=['POST'])
 def evaluate_endpoint():
+    ensure_initialized()
     """Evalúa el modelo en el conjunto de test"""
     try:
         data = request.get_json() or {}
