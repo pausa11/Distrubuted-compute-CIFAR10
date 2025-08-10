@@ -1,8 +1,10 @@
-torch==2.1.0+cpu
-torchvision==0.16.0+cpu
+# versiones compatibles con Python 3.13
+torch==2.6.0
+torchvision==0.21.0
 flask==2.3.3
-numpy==1.24.3
+# deja que pip resuelva numpy; si quieres fijar:
+# numpy>=1.26,<3
 Pillow==10.0.1
 
-# Para encontrar las versiones CPU de PyTorch
---find-links https://download.pytorch.org/whl/torch_stable.html
+# quita esta línea; ya no hace falta para CPU:
+# --find-links https://download.pytorch.org/whl/torch_stable.html
