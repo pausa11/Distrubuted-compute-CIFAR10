@@ -1,0 +1,8 @@
+torch==2.1.0+cpu
+torchvision==0.16.0+cpu
+flask==2.3.3
+numpy==1.24.3
+Pillow==10.0.1
+
+# Para encontrar las versiones CPU de PyTorch
+--find-links https://download.pytorch.org/whl/torch_stable.html
