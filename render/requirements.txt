@@ -1,10 +1,5 @@
-# versiones compatibles con Python 3.13
 torch==2.6.0
 torchvision==0.21.0
-flask==2.3.3
-# deja que pip resuelva numpy; si quieres fijar:
-# numpy>=1.26,<3
-Pillow==10.0.1
-
-# quita esta línea; ya no hace falta para CPU:
-# --find-links https://download.pytorch.org/whl/torch_stable.html
+flask==3.0.3
+numpy>=1.26,<3
+pillow>=11.0.0
