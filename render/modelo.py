@@ -318,5 +318,3 @@ def evaluate_endpoint():
     except Exception as e:
         logger.exception("Error en evaluate")
         return jsonify({"error": str(e)}), 500
-
-# Nota: NO hay bloque if __name__ == "__main__" para evitar inicios no deseados con gunicorn.
