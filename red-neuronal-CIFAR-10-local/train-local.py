@@ -2,19 +2,20 @@ import os
 import random
 import argparse
 import time
-from pathlib import Path
 import multiprocessing as mp
+from pathlib import Path
 
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
+
 from rich.progress import Progress
 from rich.table import Table
 from rich.console import Console
-import torch.nn.functional as F
 
 console = Console()
 
@@ -284,7 +285,7 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)  # recomendado en macOS
 
     parser = argparse.ArgumentParser(description="CIFAR-10 optimizado para Mac M4 (núcleos fijos)")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
