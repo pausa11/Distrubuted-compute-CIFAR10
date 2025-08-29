@@ -19,17 +19,41 @@ from rich.console import Console
 
 console = Console()
 
+# ========= Detección de núcleos =========
+def detect_cores(prefer_physical: bool = True) -> int:
+    """
+    Devuelve el número de núcleos a usar.
+    - Intenta núcleos físicos con psutil si está disponible.
+    - Si falla, usa lógicos (os.cpu_count()).
+    """
+    n = None
+    if prefer_physical:
+        try:
+            import psutil 
+            n_phys = psutil.cpu_count(logical=False) or 0
+            if n_phys > 0:
+                n = n_phys
+                console.print(f"[green]Detectados núcleos físicos: {n}[/green]")
+        except Exception:
+            pass
+    if n is None:
+        n_log = os.cpu_count() or 1
+        n = max(1, int(n_log))
+        console.print(f"[yellow]Usando núcleos lógicos: {n}[/yellow]")
+    return n
+
 # ========= Hilos / Núcleos =========
 def set_threads(n: int):
     n = max(1, int(n))
     # PyTorch
-    torch.set_num_threads(n)                      # intra-op
-    torch.set_num_interop_threads(max(1, n // 2)) # inter-op (más estable)
+    torch.set_num_threads(n)                            # intra-op parallelism
+    # Heurística: inter-op un poco menor que intra para estabilidad
+    torch.set_num_interop_threads(max(1, min(n, max(1, n // 2))))
     # BLAS / OpenMP / Accelerate
     os.environ["OMP_NUM_THREADS"] = str(n)
     os.environ["OPENBLAS_NUM_THREADS"] = str(n)
     os.environ["MKL_NUM_THREADS"] = str(n)
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)   # macOS Accelerate
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(n)       # macOS Accelerate
     os.environ["NUMEXPR_NUM_THREADS"] = str(n)
 
 # ====== Modelo con optimizaciones ======
@@ -123,9 +147,9 @@ def pick_device(prefer="auto"):
     if prefer == "mps" and torch.backends.mps.is_available():
         return torch.device("mps")
     if prefer == "auto":
+        # Por tu requerimiento de usar todos los cores, default = CPU
         if torch.backends.mps.is_available():
-            console.print("[yellow]MPS disponible, pero usando CPU por petición (núcleos fijos)[/yellow]")
-            return torch.device("cpu")
+            console.print("[yellow]MPS disponible, pero usando CPU para aprovechar hilos[/yellow]")
         return torch.device("cpu")
     return torch.device("cpu")
 
@@ -147,7 +171,7 @@ def evaluate(model, loader, device):
     return total_loss / total, correct / total
 
 # ====== Compilación opcional ======
-def compile_model(model, device):
+def compile_model(model):
     try:
         import sys
         python_version = sys.version_info
@@ -168,19 +192,23 @@ def compile_model(model, device):
 
 # ====== Entrenamiento ======
 def train(args):
+    # Detectar cores si no se pasan
+    if args.cores is None:
+        args.cores = detect_cores(prefer_physical=True)
+
     # Fijar EXACTAMENTE los núcleos solicitados
     set_threads(args.cores)
     set_seed(args.seed)
 
     device = pick_device(args.device if not args.cpu else "cpu")
     console.print(f"Using device: [bold]{device}[/bold]")
-    console.print(f"Núcleos solicitados: [bold]{args.cores}[/bold]")
+    console.print(f"Núcleos a usar: [bold]{args.cores}[/bold]")
     console.print(f"PyTorch intra-op threads: [bold]{torch.get_num_threads()}[/bold]")
 
     # En CPU: pin_memory=False
     pin = False
 
-    # Si no pasaron --workers, igualar a --cores
+    # Si no pasaron --workers, igualar a --cores (usar todos)
     if args.workers is None:
         args.workers = args.cores
 
@@ -282,15 +310,15 @@ def train(args):
     console.print(table)
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)  # recomendado en macOS
+    mp.set_start_method('spawn', force=True)
 
-    parser = argparse.ArgumentParser(description="CIFAR-10 optimizado para Mac M4 (núcleos fijos)")
+    parser = argparse.ArgumentParser(description="CIFAR-10 optimizado: usa automáticamente todos los núcleos")
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--workers", type=int, default=None, help="Data loader workers (None=usa --cores)")
+    parser.add_argument("--workers", type=int, default=None, help="Data loader workers (None=usa todos los cores)")
     parser.add_argument("--cpu", action="store_true", help="Forzar CPU")
     parser.add_argument("--compile", action="store_true", help="Compilar modelo (TorchScript/compile si aplica)")
     parser.add_argument("--no-compile", action="store_true", help="Desactivar compilación completamente")
@@ -298,14 +326,15 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoints", type=str, default="./checkpoints")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","mps"], help="Selecciona dispositivo")
-    parser.add_argument("--cores", type=int, default=6, help="🔥 Núcleos/hilos de CPU a usar")
+    parser.add_argument("--cores", type=int, default=None, help="🔥 Núcleos/hilos de CPU a usar (None=auto)")
 
     args = parser.parse_args()
 
+    detected = detect_cores(prefer_physical=True) if args.cores is None else args.cores
     console.print("[bold]Configuración de ejecución:[/bold]")
-    console.print(f"• Cores: {args.cores}")
+    console.print(f"• Cores: {args.cores or f'auto → {detected}'}")
     console.print(f"• Batch size: {args.batch_size}")
-    console.print(f"• Data workers: {args.workers or f'auto→{args.cores}'}")
-    console.print(f"• Compilación: {'ON' if args.compile and not args.no_compile else 'OFF' if args.no_compile else 'ON (auto)'}")
+    console.print(f"• Data workers: {args.workers or f'auto → {detected}'}")
+    console.print(f"• Compilación: {'ON' if args.compile and not args.no_compile else 'OFF' if args.no_compile else 'ON (manual si pasas --compile)'}")
 
     train(args)
