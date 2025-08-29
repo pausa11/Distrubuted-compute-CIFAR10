@@ -284,8 +284,8 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)  # recomendado en macOS
 
     parser = argparse.ArgumentParser(description="CIFAR-10 optimizado para Mac M4 (núcleos fijos)")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
@@ -297,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoints", type=str, default="./checkpoints")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", type=str, default="auto", choices=["auto","cpu","mps"], help="Selecciona dispositivo")
-    parser.add_argument("--cores", type=int, default=10, help="🔥 Núcleos/hilos de CPU a usar")
+    parser.add_argument("--cores", type=int, default=4, help="🔥 Núcleos/hilos de CPU a usar")
 
     args = parser.parse_args()
 
