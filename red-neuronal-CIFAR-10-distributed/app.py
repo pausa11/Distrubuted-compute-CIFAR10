@@ -1,12 +1,14 @@
+# server.py
 import os
 import io
 import base64
 import json
-import random
 import time
+import random
 import logging
 import threading
-from typing import Dict, Any, Tuple, Optional
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
@@ -15,83 +17,78 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-# ====== Config global dura para bajar RAM ======
-# Limitar threads de BLAS/OpenMP (muy importante en 512 MB)
+# =========================
+# Límites de hilos (RAM baja)
+# =========================
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
-# Torch: 1 hilo
 torch.set_num_threads(1)
 
+# =========================
 # Logging
+# =========================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("modelo")
+log = logging.getLogger("cifar_api")
 
+# =========================
 # Flask
+# =========================
 app = Flask(__name__)
 
-# ====== Globals controlados ======
-_init_lock = threading.Lock()
-_initialized = False
-_batch_manager = None
-_model = None
-
-# ====== Modelo ======
+# =========================
+# Modelo
+# =========================
 class SmallCIFAR(nn.Module):
-    """
-    Pequeño CNN para CIFAR-10. Mantenerlo chico reduce parámetros y activaciones.
-    """
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes: int = 10):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
+        self.pool  = nn.MaxPool2d(2, 2)
         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-        self.fc1 = nn.Linear(128 * 4 * 4, 256)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.fc1   = nn.Linear(128 * 4 * 4, 256)
+        self.drop  = nn.Dropout(0.5)
+        self.fc2   = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))  # 32x16x16
-        x = self.pool(F.relu(self.conv2(x)))  # 64x8x8
-        x = self.pool(F.relu(self.conv3(x)))  # 128x4x4
+        x = self.pool(F.relu(self.conv1(x)))   # 32x16x16
+        x = self.pool(F.relu(self.conv2(x)))   # 64x8x8
+        x = self.pool(F.relu(self.conv3(x)))   # 128x4x4
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
+        x = self.drop(x)
         x = self.fc2(x)
         return x
 
-# ====== Dataset / BatchManager ======
-class BatchManager:
-    """
-    Carga CIFAR-10 a demanda. Mantener num_workers=0 y batch_size moderado para ahorrar RAM.
-    """
-    def __init__(self, data_root: str, batch_size: int = 32):
-        self.data_root = data_root
-        self.batch_size = batch_size
-        self.device = torch.device("cpu")  # Render CPU
-        self._loaded = False
+# =========================
+# Dataset manager (lazy)
+# =========================
+class DataManager:
+    """Carga CIFAR-10 sólo cuando hace falta. Workers=0 para ahorrar RAM."""
+    def __init__(self, data_root: str, batch_size: int):
+        self.data_root   = data_root
+        self.batch_size  = batch_size
+        self._loaded     = False
+        self.train_ds    = None
+        self.test_ds     = None
 
-    def _ensure_loaded(self):
+    def ensure_loaded(self):
         if self._loaded:
             return
-        # Import lazy para que /health no cargue nada
         import torchvision
         import torchvision.transforms as T
-
-        normalize = T.Normalize((0.4914, 0.4822, 0.4465),
-                                (0.2023, 0.1994, 0.2010))
+        norm = T.Normalize((0.4914, 0.4822, 0.4465),
+                           (0.2023, 0.1994, 0.2010))
         train_tf = T.Compose([
             T.RandomCrop(32, padding=4),
             T.RandomHorizontalFlip(),
             T.ToTensor(),
-            normalize
+            norm
         ])
-        test_tf = T.Compose([T.ToTensor(), normalize])
+        test_tf = T.Compose([T.ToTensor(), norm])
 
-        # NOTA: CIFAR10 de torchvision mantiene los arrays en RAM (~180MB ambos sets).
-        # Es aceptable con 512MB si evitamos otras cargas grandes.
         self.train_ds = torchvision.datasets.CIFAR10(
             root=self.data_root, train=True, download=True, transform=train_tf
         )
@@ -99,34 +96,21 @@ class BatchManager:
             root=self.data_root, train=False, download=True, transform=test_tf
         )
         self._loaded = True
-        logger.info(f"Datasets cargados: train={len(self.train_ds)} test={len(self.test_ds)}")
+        log.info(f"Datasets cargados: train={len(self.train_ds)} test={len(self.test_ds)}")
 
-    def get_batch_loader(self, batch_indices: list) -> DataLoader:
-        self._ensure_loaded()
-        subset = Subset(self.train_ds, batch_indices)
-        return DataLoader(subset,
-                          batch_size=self.batch_size,
-                          shuffle=False,
-                          num_workers=0,
-                          pin_memory=False)
+    def train_loader(self) -> DataLoader:
+        self.ensure_loaded()
+        return DataLoader(self.train_ds, batch_size=self.batch_size,
+                          shuffle=True, num_workers=0, pin_memory=False, drop_last=True)
 
-    def get_test_loader(self) -> DataLoader:
-        self._ensure_loaded()
-        return DataLoader(self.test_ds,
-                          batch_size=self.batch_size,
-                          shuffle=False,
-                          num_workers=0,
-                          pin_memory=False)
+    def test_loader(self) -> DataLoader:
+        self.ensure_loaded()
+        return DataLoader(self.test_ds, batch_size=self.batch_size,
+                          shuffle=False, num_workers=0, pin_memory=False)
 
-    def get_batch_indices(self, batch_id: int, total_batches: int) -> list:
-        self._ensure_loaded()
-        total_samples = len(self.train_ds)
-        samples_per_batch = total_samples // total_batches
-        start_idx = batch_id * samples_per_batch
-        end_idx = (batch_id + 1) * samples_per_batch if batch_id < total_batches - 1 else total_samples
-        return list(range(start_idx, end_idx))
-
-# ====== Utils ======
+# =========================
+# Utilidades
+# =========================
 def set_seed(seed: int = 1337):
     random.seed(seed)
     np.random.seed(seed)
@@ -134,187 +118,279 @@ def set_seed(seed: int = 1337):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def _b64_from_state_dict(state: Dict[str, torch.Tensor]) -> str:
-    bio = io.BytesIO()
-    torch.save(state, bio)  # binario compacto (2–3MB aprox para este modelo)
-    return base64.b64encode(bio.getvalue()).decode("ascii")
-
-def _state_dict_from_b64(b64: str) -> Dict[str, torch.Tensor]:
-    raw = base64.b64decode(b64.encode("ascii"))
-    bio = io.BytesIO(raw)
-    return torch.load(bio, map_location="cpu")
-
-def ensure_initialized(load_data: bool = False):
-    """
-    Inicializa de forma perezosa y thread-safe. Por defecto NO carga datasets
-    (para que /health no gaste RAM). Los endpoints que entrenan/evalúan
-    pasan load_data=True.
-    """
-    global _initialized, _batch_manager, _model
-    if _initialized and (not load_data or (_batch_manager and _batch_manager._loaded)):
-        return
-
-    with _init_lock:
-        if not _initialized:
-            data_root = os.environ.get("DATA_ROOT", "/tmp/torch-datasets")
-            batch_size = int(os.environ.get("BATCH_SIZE", "32"))
-            _batch_manager = BatchManager(data_root=data_root, batch_size=batch_size)
-            _model = SmallCIFAR().to(torch.device("cpu"))
-            _initialized = True
-            logger.info("Componentes base listos (sin datasets).")
-        if load_data and not _batch_manager._loaded:
-            _batch_manager._ensure_loaded()
-
 @torch.no_grad()
-def evaluate_batch(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
     model.eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    crit = nn.CrossEntropyLoss()
+    total_loss, total, correct = 0.0, 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         logits = model(images)
-        loss = criterion(logits, labels)
+        loss = crit(logits, labels)
         total_loss += loss.item() * images.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
+        pred = logits.argmax(1)
+        correct += (pred == labels).sum().item()
         total += labels.size(0)
     return (total_loss / total) if total else 0.0, (correct / total) if total else 0.0
 
-def train_one_batch(
-    model: nn.Module,
-    batch_loader: DataLoader,
-    optimizer: optim.Optimizer,
-    device: torch.device
-) -> Dict[str, Any]:
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    start_time = time.time()
-    for images, labels in batch_loader:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * images.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-    training_time = time.time() - start_time
-    return {
-        "loss": (total_loss / total) if total else 0.0,
-        "accuracy": (correct / total) if total else 0.0,
-        "samples_processed": total,
-        "training_time": training_time,
+def state_dict_to_b64(state: Dict[str, torch.Tensor]) -> str:
+    bio = io.BytesIO()
+    torch.save(state, bio)
+    return base64.b64encode(bio.getvalue()).decode("ascii")
+
+def state_dict_from_b64(b64: str) -> Dict[str, torch.Tensor]:
+    raw = base64.b64decode(b64.encode("ascii"))
+    return torch.load(io.BytesIO(raw), map_location="cpu")
+
+# =========================
+# Estado de entrenamiento
+# =========================
+@dataclass
+class TrainConfig:
+    epochs: int = 10
+    lr: float = 0.1
+    momentum: float = 0.9
+    weight_decay: float = 5e-4
+    batch_size: int = 64
+    seed: int = 1337
+    checkpoint_path: str = "./checkpoints/best.pt"
+    eval_each_epoch: bool = True
+    return_state_b64: bool = False  # si quieres devolver el modelo al terminar
+
+TRAIN_LOCK = threading.Lock()
+TRAIN_RUNNING = False
+TRAIN_STOP = threading.Event()
+TRAIN_PROGRESS: Dict[str, Any] = {
+    "running": False,
+    "epoch": 0,
+    "epochs": 0,
+    "train_loss": None,
+    "train_acc": None,
+    "val_loss": None,
+    "val_acc": None,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+}
+
+# =========================
+# Globals del servicio
+# =========================
+_model: Optional[SmallCIFAR] = None
+_data: Optional[DataManager] = None
+_init_lock = threading.Lock()
+
+def ensure_initialized(load_data: bool = False, batch_size: int = 64):
+    global _model, _data
+    if _model is not None and _data is not None and (not load_data or _data._loaded):
+        return
+    with _init_lock:
+        if _model is None:
+            _model = SmallCIFAR().to(torch.device("cpu"))
+            log.info("Modelo inicializado en CPU.")
+        if _data is None:
+            data_root = os.environ.get("DATA_ROOT", "/tmp/torch-datasets")
+            _data = DataManager(data_root=data_root, batch_size=batch_size)
+            log.info(f"DataManager listo (root={data_root}, batch_size={batch_size}).")
+        if load_data and not _data._loaded:
+            _data.ensure_loaded()
+
+# =========================
+# Bucle de entrenamiento
+# =========================
+def train_worker(cfg: TrainConfig):
+    global TRAIN_RUNNING, TRAIN_PROGRESS
+    device = torch.device("cpu")
+    try:
+        set_seed(cfg.seed)
+        ensure_initialized(load_data=True, batch_size=cfg.batch_size)
+
+        model = _model  # global
+        optimizer = optim.SGD(model.parameters(), lr=cfg.lr,
+                              momentum=cfg.momentum, weight_decay=cfg.weight_decay)
+        criterion = nn.CrossEntropyLoss()
+        train_loader = _data.train_loader()
+        val_loader = _data.test_loader() if cfg.eval_each_epoch else None
+
+        with TRAIN_LOCK:
+            TRAIN_RUNNING = True
+            TRAIN_STOP.clear()
+            TRAIN_PROGRESS.update({
+                "running": True,
+                "epoch": 0,
+                "epochs": cfg.epochs,
+                "started_at": time.time(),
+                "finished_at": None,
+                "last_error": None,
+                "train_loss": None,
+                "train_acc": None,
+                "val_loss": None,
+                "val_acc": None,
+            })
+
+        best_acc = -1.0
+        os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
+
+        for epoch in range(1, cfg.epochs + 1):
+            if TRAIN_STOP.is_set():
+                log.warning("Entrenamiento cancelado por /stop.")
+                break
+
+            model.train()
+            total, correct, running_loss = 0, 0, 0.0
+            t0 = time.time()
+
+            for images, labels in train_loader:
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = criterion(logits, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                running_loss += loss.item() * images.size(0)
+                pred = logits.argmax(1)
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
+
+            train_loss = (running_loss / total) if total else 0.0
+            train_acc  = (correct / total) if total else 0.0
+
+            val_loss, val_acc = (None, None)
+            if val_loader is not None:
+                val_loss, val_acc = evaluate(model, val_loader, device)
+                # checkpoint sencillo
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    torch.save({"model_state": model.state_dict(),
+                                "val_acc": val_acc,
+                                "epoch": epoch}, cfg.checkpoint_path)
+
+            with TRAIN_LOCK:
+                TRAIN_PROGRESS.update({
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "epoch_time_s": round(time.time() - t0, 3),
+                })
+
+            log.info(f"[Epoch {epoch}/{cfg.epochs}] "
+                     f"train_loss={train_loss:.4f} acc={train_acc:.4f} "
+                     f"val_loss={val_loss if val_loss is not None else '-'} "
+                     f"val_acc={val_acc if val_acc is not None else '-'}")
+
+        with TRAIN_LOCK:
+            TRAIN_RUNNING = False
+            TRAIN_PROGRESS["running"] = False
+            TRAIN_PROGRESS["finished_at"] = time.time()
+
+        if cfg.return_state_b64:
+            # nada que devolver por hilo; /status puede ofrecerlo bajo demanda
+            pass
+
+    except Exception as e:
+        log.exception("Fallo en entrenamiento")
+        with TRAIN_LOCK:
+            TRAIN_RUNNING = False
+            TRAIN_PROGRESS["running"] = False
+            TRAIN_PROGRESS["finished_at"] = time.time()
+            TRAIN_PROGRESS["last_error"] = str(e)
+
+# =========================
+# Endpoints
+# =========================
+@app.get("/health")
+def health():
+    # No fuerza carga de datasets
+    return jsonify({"status": "ok", "training_running": TRAIN_RUNNING}), 200
+
+@app.get("/status")
+def status():
+    # Devuelve progreso actual (si hay)
+    with TRAIN_LOCK:
+        out = dict(TRAIN_PROGRESS)
+    # tiempos legibles
+    if out.get("started_at"):
+        out["started_at_iso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(out["started_at"]))
+    if out.get("finished_at"):
+        out["finished_at_iso"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(out["finished_at"]))
+    return jsonify(out), 200
+
+@app.post("/train")
+def train_endpoint():
+    """
+    Lanza entrenamiento asíncrono.
+
+    JSON opcional:
+    {
+      "epochs": 10,
+      "lr": 0.1,
+      "momentum": 0.9,
+      "weight_decay": 0.0005,
+      "batch_size": 64,
+      "seed": 1337,
+      "checkpoint_path": "./checkpoints/best.pt",
+      "eval_each_epoch": true,
+      "return_state_b64": false
     }
+    """
+    if TRAIN_RUNNING:
+        return jsonify({"message": "Ya hay entrenamiento en curso"}), 409
 
-# ====== Endpoints ======
-@app.route("/health", methods=["GET"])
-def health_check():
-    # NO cargamos nada aquí. RAM mínima.
-    return jsonify({"status": "healthy", "message": "Node is running"}), 200
+    body = request.get_json(silent=True) or {}
+    try:
+        cfg = TrainConfig(**{k: body[k] for k in body if k in TrainConfig.__annotations__})
+    except TypeError as e:
+        return jsonify({"error": f"Parámetros inválidos: {e}"}), 400
 
-@app.route("/info", methods=["GET"])
-def get_info():
-    # Solo inicializamos componentes base (modelo vacío). No carga datasets.
+    # Inicializa base (modelo + datamanager, sin cargar datasets aún)
+    ensure_initialized(load_data=False, batch_size=cfg.batch_size)
+
+    t = threading.Thread(target=train_worker, args=(cfg,), daemon=True)
+    t.start()
+    return jsonify({"message": "Entrenamiento iniciado", "config": asdict(cfg)}), 202
+
+@app.post("/stop")
+def stop():
+    """Solicita cancelar el entrenamiento en curso (se detiene al final de la época)."""
+    if not TRAIN_RUNNING:
+        return jsonify({"message": "No hay entrenamiento en curso"}), 400
+    TRAIN_STOP.set()
+    return jsonify({"message": "Cancelación solicitada"}), 200
+
+@app.post("/evaluate")
+def eval_endpoint():
+    """Evalúa el modelo actual sobre test (carga datasets si no están)."""
+    ensure_initialized(load_data=True, batch_size=int((request.json or {}).get("batch_size", 64)))
+    loss, acc = evaluate(_model, _data.test_loader(), torch.device("cpu"))
+    return jsonify({"test_loss": loss, "test_accuracy": acc, "samples": len(_data.test_ds)}), 200
+
+@app.get("/model/b64")
+def download_model_b64():
+    """Devuelve el state_dict en base64 (útil para sincronizar nodos)."""
     ensure_initialized(load_data=False)
-    param_count = sum(p.numel() for p in _model.parameters())
-    return jsonify({
-        "device": "cpu",
-        "model_params": param_count,
-        "batch_size": int(os.environ.get("BATCH_SIZE", "32")),
-        "datasets_loaded": bool(_batch_manager and _batch_manager._loaded)
-    }), 200
+    b64 = state_dict_to_b64(_model.state_dict())
+    return jsonify({"model_state_b64": b64}), 200
 
-@app.route("/train_batch", methods=["POST"])
-def train_batch_endpoint():
-    try:
-        data = request.get_json(force=True) or {}
-        # Inicializa Y carga datasets solo aquí
-        ensure_initialized(load_data=True)
+@app.post("/model/b64")
+def upload_model_b64():
+    """Carga un state_dict desde base64."""
+    data = request.get_json(silent=True) or {}
+    b64 = data.get("model_state_b64")
+    if not b64:
+        return jsonify({"error": "model_state_b64 requerido"}), 400
+    ensure_initialized(load_data=False)
+    _model.load_state_dict(state_dict_from_b64(b64))
+    return jsonify({"message": "Modelo actualizado"}), 200
 
-        # Validaciones
-        for p in ("batch_id", "total_batches"):
-            if p not in data:
-                return jsonify({"error": f"Missing parameter: {p}"}), 400
-
-        batch_id = int(data["batch_id"])
-        total_batches = int(data["total_batches"])
-        if batch_id < 0 or batch_id >= total_batches:
-            return jsonify({"error": "batch_id out of range"}), 400
-
-        # Hiperparámetros
-        lr = float(data.get("lr", 0.1))
-        momentum = float(data.get("momentum", 0.9))
-        weight_decay = float(data.get("weight_decay", 5e-4))
-        seed = int(data.get("seed", 1337))
-        include_state = bool(data.get("include_state", True))  # por defecto True
-        incoming_state_b64 = data.get("model_state_b64")  # estado entrante en base64 (opcional)
-
-        set_seed(seed)
-
-        # Cargar estado si viene
-        if incoming_state_b64:
-            _model.load_state_dict(_state_dict_from_b64(incoming_state_b64))
-
-        # Batch loader
-        batch_indices = _batch_manager.get_batch_indices(batch_id, total_batches)
-        batch_loader = _batch_manager.get_batch_loader(batch_indices)
-
-        # Optimizer por-request (no se guarda)
-        optimizer = optim.SGD(_model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-
-        logger.info(f"Entrenando batch {batch_id}/{total_batches} (tam={len(batch_indices)}) ...")
-        results = train_one_batch(_model, batch_loader, optimizer, torch.device("cpu"))
-
-        response = {
-            "batch_id": batch_id,
-            "total_batches": total_batches,
-            "batch_size": len(batch_indices),
-            "loss": results["loss"],
-            "accuracy": results["accuracy"],
-            "samples_processed": results["samples_processed"],
-            "training_time": results["training_time"],
-            "status": "completed"
-        }
-
-        # Estado del modelo opcional y en base64 BINARIO (no listas gigantes)
-        if include_state:
-            response["model_state_b64"] = _b64_from_state_dict(_model.state_dict())
-
-        logger.info(f"Batch {batch_id} OK - Loss: {results['loss']:.4f}, Acc: {results['accuracy']:.4f}")
-        return jsonify(response), 200
-
-    except Exception as e:
-        logger.exception("Error en train_batch")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/evaluate", methods=["POST"])
-def evaluate_endpoint():
-    try:
-        data = request.get_json(silent=True) or {}
-        # Inicializa y carga datasets solo si llamas /evaluate
-        ensure_initialized(load_data=True)
-
-        incoming_state_b64 = data.get("model_state_b64")
-        if incoming_state_b64:
-            _model.load_state_dict(_state_dict_from_b64(incoming_state_b64))
-
-        loader = _batch_manager.get_test_loader()
-        with torch.inference_mode():
-            test_loss, test_acc = evaluate_batch(_model, loader, torch.device("cpu"))
-
-        return jsonify({
-            "test_loss": test_loss,
-            "test_accuracy": test_acc,
-            "samples_evaluated": len(_batch_manager.test_ds)
-        }), 200
-
-    except Exception as e:
-        logger.exception("Error en evaluate")
-        return jsonify({"error": str(e)}), 500
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    # Variables de entorno útiles:
+    #   DATA_ROOT=/ruta/a/datasets  (default: /tmp/torch-datasets)
+    #   FLASK_RUN_PORT=8000
+    app.run(host="0.0.0.0", port=int(os.environ.get("FLASK_RUN_PORT", "8000")))
