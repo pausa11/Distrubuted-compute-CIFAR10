@@ -26,7 +26,7 @@ logger = logging.getLogger("controller")
 
 # Ajusta aquí los hosts de tus nodos (agents)
 NODE_HOSTS = {
-    "node-0": "http://10.253.32.233:6000",
+    "node-0": "http://192.168.20.3:6000",
     "node-1": "http://10.128.0.6:6000",
     "node-2": "http://10.128.0.7:6000",
     "node-3": "http://10.128.0.8:6000",
@@ -40,6 +40,9 @@ HTTP_TIMEOUT_METR  = float(os.environ.get("HTTP_TIMEOUT_METR", "1.5"))   # s par
 SSE_HEARTBEAT_EVERY = 10  # iteraciones del loop SSE (~0.5s * 10 = 5s aprox)
 METRICS_POLL_INTERVAL = float(os.environ.get("METRICS_POLL_INTERVAL", "1.0"))  # s
 
+# NUEVO: desactiva polling de /metrics por defecto (0=off, 1=on)
+ENABLE_REALTIME_POLL = os.environ.get("ENABLE_REALTIME_POLL", "0") == "1"
+
 # ==========================
 # Flask app
 # ==========================
@@ -50,22 +53,26 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Modelo (igual al del agent)
 # ==========================
 class SmallCIFAR(nn.Module):
-    """Debe coincidir con el modelo del agent para que el state_dict sea compatible."""
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-        self.fc1 = nn.Linear(128 * 4 * 4, 256)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.bn1   = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1, groups=1)
+        self.bn2   = nn.BatchNorm2d(64)
+        self.pool  = nn.MaxPool2d(2, 2)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1, groups=1)
+        self.bn3   = nn.BatchNorm2d(128)
+        self.fc1   = nn.Linear(128 * 4 * 4, 256)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2   = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))  # -> (32,16,16)
-        x = self.pool(F.relu(self.conv2(x)))  # -> (64,8,8)
-        x = self.pool(F.relu(self.conv3(x)))  # -> (128,4,4)
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 32x16x16
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 64x8x8
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))  # 128x4x4
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         x = self.fc2(x)
         return x
 
@@ -123,12 +130,11 @@ def _poll_metrics_loop(session_id: str):
                 r = requests.get(f"{base}/metrics", timeout=HTTP_TIMEOUT_METR)
                 if r.ok:
                     data = r.json()
-                    # Fusiona sin pisar loss/acc/epoch si ya existen
                     METRICS.setdefault(session_id, {}).setdefault(node_id, {})
                     METRICS[session_id][node_id].update({
-                        "cpu": float(data.get("cpu", 0.0)),
-                        "ram": float(data.get("ram", 0.0)),
                         "ts": float(data.get("ts", time.time())),
+                        "datasets_loaded": bool(data.get("datasets_loaded", False)),
+                        "batch_size": int(data.get("batch_size", 0)),
                         "node_id": node_id
                     })
                 else:
@@ -181,6 +187,7 @@ def _train_fedavg_loop(session_id: str,
                             "include_state": True,
                         }
                         futures.append((node_id, batch_id, ex.submit(post_json, f"{base}/train_batch", payload, HTTP_TIMEOUT_TRAIN)))
+
                     sd_list, weights, pernode = [], [], []
                     for node_id, batch_id, fut in futures:
                         try:
@@ -188,7 +195,11 @@ def _train_fedavg_loop(session_id: str,
                             if not r.ok:
                                 raise RuntimeError(f"HTTP {r.status_code}")
                             resp = r.json()
+
+                            # Registrar métricas de rendimiento + recursos del nodo (sin necesidad de /metrics)
                             METRICS.setdefault(session_id, {}).setdefault(node_id, {})
+                            # Recursos enviados por agent al final del batch
+                            res = resp.get("resources", {}) or {}
                             METRICS[session_id][node_id].update({
                                 "epoch": epoch,
                                 "loss": float(resp["loss"]),
@@ -196,9 +207,13 @@ def _train_fedavg_loop(session_id: str,
                                 "samples": int(resp["samples_processed"]),
                                 "batch_id": int(resp["batch_id"]),
                                 "total_batches": int(resp["total_batches"]),
+                                "avg_cpu_pct": float(res.get("avg_cpu_pct", 0.0)),
+                                "peak_ram_pct": float(res.get("peak_ram_pct", 0.0)),
+                                "peak_rss_bytes": int(res.get("peak_rss_bytes", 0)),
                                 "ts": time.time(),
                                 "node_id": node_id
                             })
+
                             sd = b64_to_state(resp["model_state_b64"])
                             sd_list.append(sd)
                             w = max(1, int(resp["samples_processed"]))
@@ -206,19 +221,23 @@ def _train_fedavg_loop(session_id: str,
                             pernode.append(resp)
                         except Exception as e:
                             logger.error(f"[{session_id}] Nodo {node_id} falló en sub-ronda {sub+1}/{subrounds}: {e}")
+
                     if not sd_list:
                         SESSIONS[session_id]["status"] = "failed"
                         SESSIONS[session_id]["running"] = False
                         logger.error(f"[{session_id}] No se recibieron estados en la sub-ronda {sub+1}. Abortando.")
                         return
+
                     new_sd = fedavg_state_dicts(sd_list, weights)
                     current_b64 = state_to_b64(new_sd)
+
                     wsum = float(sum(weights))
                     sub_loss = sum(w * float(m["loss"]) for w, m in zip(weights, pernode)) / wsum
                     sub_acc  = 100.0 * sum(w * float(m["accuracy"]) for w, m in zip(weights, pernode)) / wsum
                     epoch_loss_accumulator.append((sub_loss, wsum))
                     epoch_acc_accumulator.append((sub_acc,  wsum))
                     epoch_weight_accumulator.append(wsum)
+
                     METRICS[session_id]["all"] = {
                         "epoch": epoch,
                         "loss": float(sub_loss),
@@ -226,12 +245,14 @@ def _train_fedavg_loop(session_id: str,
                         "ts": time.time(),
                         "node_id": "all"
                     }
+
             if epoch_loss_accumulator:
                 total_w = sum(epoch_weight_accumulator)
                 g_loss = sum(l * w for (l, w) in epoch_loss_accumulator) / total_w
                 g_acc  = sum(a * w for (a, w) in epoch_acc_accumulator) / total_w
             else:
                 g_loss, g_acc = 0.0, 0.0
+
             METRICS[session_id]["all"] = {
                 "epoch": epoch,
                 "loss": float(g_loss),
@@ -240,6 +261,7 @@ def _train_fedavg_loop(session_id: str,
                 "node_id": "all"
             }
             logger.info(f"[{session_id}] Epoch {epoch}/{epochs}: loss={g_loss:.4f} acc={g_acc:.2f}%")
+
         SESSIONS[session_id]["status"] = "completed"
         SESSIONS[session_id]["running"] = False
     except Exception as e:
@@ -300,7 +322,7 @@ def start_train():
         model = SmallCIFAR().cpu()
         init_b64 = state_to_b64(model.state_dict())
 
-        # Lanzar hilos: 1) entrenamiento, 2) poll de métricas (CPU/RAM)
+        # Lanzar hilos: 1) entrenamiento, 2) poll de métricas (solo si está habilitado)
         t_train = threading.Thread(
             target=_train_fedavg_loop,
             args=(session_id, nodes, epochs, init_b64, lr, momentum, weight_decay, seed, shards_per_epoch),
@@ -308,8 +330,12 @@ def start_train():
         )
         t_train.start()
 
-        t_poll = threading.Thread(target=_poll_metrics_loop, args=(session_id,), daemon=True)
-        t_poll.start()
+        if ENABLE_REALTIME_POLL:
+            t_poll = threading.Thread(target=_poll_metrics_loop, args=(session_id,), daemon=True)
+            t_poll.start()
+            logger.info(f"[{session_id}] Realtime /metrics polling ACTIVADO (ENABLE_REALTIME_POLL=1)")
+        else:
+            logger.info(f"[{session_id}] Realtime /metrics polling DESACTIVADO (ENABLE_REALTIME_POLL=0)")
 
         logger.info(f"Iniciada sesión {session_id} con nodos: {nodes}")
         return jsonify({"session_id": session_id, "status": "started"})
@@ -327,7 +353,7 @@ def sse(session_id: str):
     - event: completed / stopped / disconnected
     """
     def stream():
-        last_sent_key = {}  # node_id -> (epoch, ts)  (usa ts para cpu/ram también)
+        last_sent_ts: Dict[str, float] = {}  # node_id -> ts
         heartbeat_count = 0
 
         if session_id not in SESSIONS:
@@ -341,10 +367,9 @@ def sse(session_id: str):
                 session_metrics = METRICS.get(session_id, {})
 
                 for node_id, m in list(session_metrics.items()):
-                    # Clave de cambio: usa timestamp siempre (cpu/ram pueden cambiar sin variar epoch)
-                    key = (float(m.get("ts", 0.0)))
-                    if last_sent_key.get(node_id) != key:
-                        last_sent_key[node_id] = key
+                    ts = float(m.get("ts", 0.0))
+                    if last_sent_ts.get(node_id) != ts:
+                        last_sent_ts[node_id] = ts
                         payload = {**m, "node_id": node_id, "session_id": session_id}
                         yield f"event: metrics\ndata: {json.dumps(payload)}\n\n"
 
@@ -462,6 +487,6 @@ def internal_error(err):
 # Main
 # ==========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "6001"))
     logger.info(f"Iniciando controller en 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
