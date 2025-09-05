@@ -26,7 +26,7 @@ logger = logging.getLogger("controller")
 
 # Ajusta aquí los hosts de tus nodos (agents)
 NODE_HOSTS = {
-    "node-0": "http://192.168.20.3:6000",
+    "node-0": "http://34.132.166.106:6000",
     "node-1": "http://192.168.20.3:6002",
     "node-2": "http://192.168.20.3:6003",
     "node-3": "http://192.168.20.3:6004",
