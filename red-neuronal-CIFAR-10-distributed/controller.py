@@ -27,21 +27,29 @@ logger = logging.getLogger("controller")
 # Ajusta aquí los hosts de tus nodos (agents)
 NODE_HOSTS = {
     "node-0": "http://192.168.20.3:6000",
-    "node-1": "http://10.128.0.6:6000",
-    "node-2": "http://10.128.0.7:6000",
-    "node-3": "http://10.128.0.8:6000",
-    "node-4": "http://10.128.0.9:6000",
+    "node-1": "http://192.168.20.3:6002",
+    "node-2": "http://192.168.20.3:6003",
+    "node-3": "http://192.168.20.3:6004",
+    "node-4": "http://192.168.20.3:6005",
 }
 
 # Timeouts / intervalos
 HTTP_TIMEOUT_TRAIN = float(os.environ.get("HTTP_TIMEOUT_TRAIN", "120"))  # s por /train_batch
 HTTP_TIMEOUT_PING  = float(os.environ.get("HTTP_TIMEOUT_PING", "2"))     # s para /health
 HTTP_TIMEOUT_METR  = float(os.environ.get("HTTP_TIMEOUT_METR", "1.5"))   # s para /metrics
-SSE_HEARTBEAT_EVERY = 10  # iteraciones del loop SSE (~0.5s * 10 = 5s aprox)
+SSE_HEARTBEAT_EVERY = 10  # iteraciones (~0.5s * 10 = 5s aprox)
 METRICS_POLL_INTERVAL = float(os.environ.get("METRICS_POLL_INTERVAL", "1.0"))  # s
 
-# NUEVO: desactiva polling de /metrics por defecto (0=off, 1=on)
+# Telemetría en vivo (desactivada por defecto)
 ENABLE_REALTIME_POLL = os.environ.get("ENABLE_REALTIME_POLL", "0") == "1"
+
+# Defaults de hiperparámetros "estilo script bueno"
+DEFAULT_LOCAL_EPOCHS    = int(os.environ.get("DEFAULT_LOCAL_EPOCHS", "1"))
+DEFAULT_BATCH_SIZE      = int(os.environ.get("DEFAULT_BATCH_SIZE", "256"))
+DEFAULT_WORKERS         = int(os.environ.get("DEFAULT_WORKERS", "0"))
+DEFAULT_ONECYCLE        = os.environ.get("DEFAULT_ONECYCLE", "1") == "1"
+DEFAULT_CLIP_GRAD_NORM  = float(os.environ.get("DEFAULT_CLIP_GRAD_NORM", "1.0"))
+DEFAULT_NESTEROV        = os.environ.get("DEFAULT_NESTEROV", "1") == "1"
 
 # ==========================
 # Flask app
@@ -114,10 +122,10 @@ def post_json(url: str, payload: Dict[str, Any], timeout: float):
     return requests.post(url, json=payload, timeout=timeout)
 
 # ==========================
-# Polling de /metrics (CPU/RAM)
+# Polling de /metrics (opcional)
 # ==========================
 def _poll_metrics_loop(session_id: str):
-    """Hilo que sondea /metrics en cada nodo y fusiona CPU/RAM en METRICS[session_id]."""
+    """Hilo que sondea /metrics en cada nodo (sin CPU/RAM en vivo en el agent)."""
     logger.info(f"[{session_id}] Iniciando poll de /metrics")
     while SESSIONS.get(session_id, {}).get("running", False):
         info = SESSIONS.get(session_id) or {}
@@ -134,13 +142,13 @@ def _poll_metrics_loop(session_id: str):
                     METRICS[session_id][node_id].update({
                         "ts": float(data.get("ts", time.time())),
                         "datasets_loaded": bool(data.get("datasets_loaded", False)),
-                        "batch_size": int(data.get("batch_size", 0)),
+                        "batch_size_agent": int(data.get("batch_size", 0)),
+                        "workers_agent": int(data.get("workers", 0)),
                         "node_id": node_id
                     })
                 else:
                     logger.debug(f"[{session_id}] /metrics {node_id} HTTP {r.status_code}")
             except requests.exceptions.RequestException:
-                # nodos caídos o lentos: ignora
                 pass
         time.sleep(METRICS_POLL_INTERVAL)
     logger.info(f"[{session_id}] Fin de poll de /metrics")
@@ -154,19 +162,24 @@ def _train_fedavg_loop(session_id: str,
                        init_b64: str,
                        lr: float, momentum: float, weight_decay: float,
                        seed: int,
-                       shards_per_epoch: int):
+                       shards_per_epoch: int,
+                       hp_defaults: Dict[str, Any]):
     try:
         logger.info(f"[{session_id}] Iniciando FedAvg: epochs={epochs}, shards_per_epoch={shards_per_epoch}, nodes={nodes}")
         current_b64 = init_b64
         total_batches = max(1, len(nodes) * max(1, shards_per_epoch))
+
         for epoch in range(1, epochs + 1):
             if not SESSIONS.get(session_id, {}).get("running", False):
                 break
+
             subrounds = (total_batches + len(nodes) - 1) // len(nodes)
             epoch_loss_accumulator, epoch_acc_accumulator, epoch_weight_accumulator = [], [], []
+
             for sub in range(subrounds):
                 if not SESSIONS.get(session_id, {}).get("running", False):
                     break
+
                 futures = []
                 with ThreadPoolExecutor(max_workers=len(nodes)) as ex:
                     for idx, node_id in enumerate(nodes):
@@ -176,6 +189,8 @@ def _train_fedavg_loop(session_id: str,
                         base = NODE_HOSTS.get(node_id)
                         if not base:
                             continue
+
+                        # Payload con hiperparámetros "estilo script bueno"
                         payload = {
                             "batch_id": batch_id,
                             "total_batches": total_batches,
@@ -185,7 +200,16 @@ def _train_fedavg_loop(session_id: str,
                             "seed": seed + epoch + sub,
                             "model_state_b64": current_b64,
                             "include_state": True,
+
+                            # === Hiperparámetros añadidos ===
+                            "local_epochs": int(hp_defaults["local_epochs"]),
+                            "onecycle": bool(hp_defaults["onecycle"]),
+                            "clip_grad_norm": float(hp_defaults["clip_grad_norm"]),
+                            "nesterov": bool(hp_defaults["nesterov"]),
+                            "batch_size": int(hp_defaults["batch_size"]) if hp_defaults["batch_size"] > 0 else None,
+                            "workers": int(hp_defaults["workers"]) if hp_defaults["workers"] >= 0 else None,
                         }
+
                         futures.append((node_id, batch_id, ex.submit(post_json, f"{base}/train_batch", payload, HTTP_TIMEOUT_TRAIN)))
 
                     sd_list, weights, pernode = [], [], []
@@ -196,9 +220,8 @@ def _train_fedavg_loop(session_id: str,
                                 raise RuntimeError(f"HTTP {r.status_code}")
                             resp = r.json()
 
-                            # Registrar métricas de rendimiento + recursos del nodo (sin necesidad de /metrics)
+                            # Registrar métricas + recursos del nodo (sin /metrics en vivo)
                             METRICS.setdefault(session_id, {}).setdefault(node_id, {})
-                            # Recursos enviados por agent al final del batch
                             res = resp.get("resources", {}) or {}
                             METRICS[session_id][node_id].update({
                                 "epoch": epoch,
@@ -211,7 +234,14 @@ def _train_fedavg_loop(session_id: str,
                                 "peak_ram_pct": float(res.get("peak_ram_pct", 0.0)),
                                 "peak_rss_bytes": int(res.get("peak_rss_bytes", 0)),
                                 "ts": time.time(),
-                                "node_id": node_id
+                                "node_id": node_id,
+
+                                # Para trazabilidad de HP usados en el agent
+                                "local_epochs": hp_defaults["local_epochs"],
+                                "onecycle": hp_defaults["onecycle"],
+                                "clip_grad_norm": hp_defaults["clip_grad_norm"],
+                                "nesterov": hp_defaults["nesterov"],
+                                "batch_size": resp.get("batch_size", hp_defaults["batch_size"]),
                             })
 
                             sd = b64_to_state(resp["model_state_b64"])
@@ -276,7 +306,8 @@ def _train_fedavg_loop(session_id: str,
 def start_train():
     """
     Inicia una sesión de entrenamiento orquestado (FedAvg).
-    Body JSON:
+
+    Body JSON (overrides opcionales de defaults):
     {
       "nodes": ["node-0","node-1",...],
       "epochs": 25,
@@ -284,7 +315,14 @@ def start_train():
       "momentum": 0.9,
       "weight_decay": 0.0005,
       "seed": 1337,
-      "shards_per_epoch": 1
+      "shards_per_epoch": 1,
+
+      "local_epochs": 1,
+      "batch_size": 256,
+      "workers": 8,
+      "onecycle": true,
+      "clip_grad_norm": 1.0,
+      "nesterov": true
     }
     """
     try:
@@ -303,6 +341,16 @@ def start_train():
         seed = int(p.get("seed", 1337))
         shards_per_epoch = int(p.get("shards_per_epoch", 1))
 
+        # Overrides opcionales de HP
+        hp_defaults = {
+            "local_epochs": int(p.get("local_epochs", DEFAULT_LOCAL_EPOCHS)),
+            "batch_size": int(p.get("batch_size", DEFAULT_BATCH_SIZE)),
+            "workers": int(p.get("workers", DEFAULT_WORKERS)),
+            "onecycle": bool(p.get("onecycle", DEFAULT_ONECYCLE)),
+            "clip_grad_norm": float(p.get("clip_grad_norm", DEFAULT_CLIP_GRAD_NORM)),
+            "nesterov": bool(p.get("nesterov", DEFAULT_NESTEROV)),
+        }
+
         session_id = str(uuid.uuid4())
         SESSIONS[session_id] = {
             "nodes": nodes,
@@ -315,6 +363,7 @@ def start_train():
             "weight_decay": weight_decay,
             "seed": seed,
             "shards_per_epoch": shards_per_epoch,
+            "hp": hp_defaults,  # guardamos para consulta
         }
         METRICS[session_id] = {}
 
@@ -322,10 +371,10 @@ def start_train():
         model = SmallCIFAR().cpu()
         init_b64 = state_to_b64(model.state_dict())
 
-        # Lanzar hilos: 1) entrenamiento, 2) poll de métricas (solo si está habilitado)
+        # Lanzar hilos
         t_train = threading.Thread(
             target=_train_fedavg_loop,
-            args=(session_id, nodes, epochs, init_b64, lr, momentum, weight_decay, seed, shards_per_epoch),
+            args=(session_id, nodes, epochs, init_b64, lr, momentum, weight_decay, seed, shards_per_epoch, hp_defaults),
             daemon=True
         )
         t_train.start()
@@ -337,8 +386,8 @@ def start_train():
         else:
             logger.info(f"[{session_id}] Realtime /metrics polling DESACTIVADO (ENABLE_REALTIME_POLL=0)")
 
-        logger.info(f"Iniciada sesión {session_id} con nodos: {nodes}")
-        return jsonify({"session_id": session_id, "status": "started"})
+        logger.info(f"Iniciada sesión {session_id} con nodos: {nodes} | HP: {hp_defaults}")
+        return jsonify({"session_id": session_id, "status": "started", "hp": hp_defaults})
     except Exception as e:
         logger.exception("Error en /train")
         return jsonify({"error": str(e)}), 500
@@ -436,6 +485,7 @@ def list_sessions():
                 "weight_decay": info.get("weight_decay"),
                 "seed": info.get("seed"),
                 "shards_per_epoch": info.get("shards_per_epoch"),
+                "hp": info.get("hp", {}),
             }
             for sid, info in SESSIONS.items()
         }
@@ -454,7 +504,7 @@ def get_session(session_id: str):
 
 @app.route("/nodes", methods=["GET"])
 def list_nodes():
-    """Verifica estado de los nodos vía /health (si responde OK => online)."""
+    """Verifica estado de los nodos vía /health."""
     node_status = {}
     for node_id, base_url in NODE_HOSTS.items():
         try:
