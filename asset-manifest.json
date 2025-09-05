@@ -1,15 +1,15 @@
 {
   "files": {
     "main.css": "/Distrubuted-compute-CIFAR10/static/css/main.1cd3e67b.css",
-    "main.js": "/Distrubuted-compute-CIFAR10/static/js/main.a540e315.js",
+    "main.js": "/Distrubuted-compute-CIFAR10/static/js/main.47eee115.js",
     "static/js/453.cba5cdfe.chunk.js": "/Distrubuted-compute-CIFAR10/static/js/453.cba5cdfe.chunk.js",
     "index.html": "/Distrubuted-compute-CIFAR10/index.html",
     "main.1cd3e67b.css.map": "/Distrubuted-compute-CIFAR10/static/css/main.1cd3e67b.css.map",
-    "main.a540e315.js.map": "/Distrubuted-compute-CIFAR10/static/js/main.a540e315.js.map",
+    "main.47eee115.js.map": "/Distrubuted-compute-CIFAR10/static/js/main.47eee115.js.map",
     "453.cba5cdfe.chunk.js.map": "/Distrubuted-compute-CIFAR10/static/js/453.cba5cdfe.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.1cd3e67b.css",
-    "static/js/main.a540e315.js"
+    "static/js/main.47eee115.js"
   ]
 }
