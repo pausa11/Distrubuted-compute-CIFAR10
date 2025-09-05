@@ -8,7 +8,7 @@ const NODES = [
   { id: "node-4", host: "34.11.238.13" },
 ];
 
-const API_BASE = "http://34.135.213.57:6001";
+const API_BASE = "https://sms-adequate-attention-intervals.trycloudflare.com";
 
 export default function App() {
   const [selected, setSelected] = useState([NODES[0].id]);
