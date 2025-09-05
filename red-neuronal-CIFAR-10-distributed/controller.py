@@ -1,4 +1,3 @@
-# controller.py
 import os
 import io
 import json
@@ -18,13 +17,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==========================
-# Config & Logging
-# ==========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("controller")
 
-# Ajusta aquí los hosts de tus nodos (agents)
 NODE_HOSTS = {
     "node-0": "http://34.132.166.106:6000",
     "node-1": "http://34.121.35.52:6000",
@@ -33,12 +28,11 @@ NODE_HOSTS = {
     "node-4": "http://34.11.238.13:6000",
 }
 
-# Timeouts / intervalos
-HTTP_TIMEOUT_TRAIN = float(os.environ.get("HTTP_TIMEOUT_TRAIN", "400"))  # s por /train_batch
-HTTP_TIMEOUT_PING  = float(os.environ.get("HTTP_TIMEOUT_PING", "2"))     # s para /health
-HTTP_TIMEOUT_METR  = float(os.environ.get("HTTP_TIMEOUT_METR", "1.5"))   # s para /metrics
-SSE_HEARTBEAT_EVERY = 10  # iteraciones (~0.5s * 10 = 5s aprox)
-METRICS_POLL_INTERVAL = float(os.environ.get("METRICS_POLL_INTERVAL", "1.0"))  # s
+HTTP_TIMEOUT_TRAIN = float(os.environ.get("HTTP_TIMEOUT_TRAIN", "400"))
+HTTP_TIMEOUT_PING  = float(os.environ.get("HTTP_TIMEOUT_PING", "2"))
+HTTP_TIMEOUT_METR  = float(os.environ.get("HTTP_TIMEOUT_METR", "1.5"))
+SSE_HEARTBEAT_EVERY = 10
+METRICS_POLL_INTERVAL = float(os.environ.get("METRICS_POLL_INTERVAL", "1.0"))
 
 # Telemetría en vivo (desactivada por defecto)
 ENABLE_REALTIME_POLL = os.environ.get("ENABLE_REALTIME_POLL", "0") == "1"
@@ -51,15 +45,11 @@ DEFAULT_ONECYCLE        = os.environ.get("DEFAULT_ONECYCLE", "1") == "1"
 DEFAULT_CLIP_GRAD_NORM  = float(os.environ.get("DEFAULT_CLIP_GRAD_NORM", "1.0"))
 DEFAULT_NESTEROV        = os.environ.get("DEFAULT_NESTEROV", "1") == "1"
 
-# ==========================
 # Flask app
-# ==========================
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ==========================
-# Modelo (igual al del agent)
-# ==========================
+# Modelo (igual al de los nodos)
 class SmallCIFAR(nn.Module):
     def __init__(self, num_classes: int = 10):
         super().__init__()
@@ -84,15 +74,11 @@ class SmallCIFAR(nn.Module):
         x = self.fc2(x)
         return x
 
-# ==========================
 # Estado global en memoria
-# ==========================
 SESSIONS: Dict[str, Dict[str, Any]] = {}   # session_id -> info
 METRICS:  Dict[str, Dict[str, Dict[str, Any]]] = {}  # session_id -> { node_id: last_metrics }
 
-# ==========================
 # Utils: (de)serialización & agregación
-# ==========================
 def state_to_b64(sd: Dict[str, torch.Tensor]) -> str:
     bio = io.BytesIO()
     torch.save(sd, bio)
@@ -121,9 +107,7 @@ def fedavg_state_dicts(sd_list: List[Dict[str, torch.Tensor]], weights: List[int
 def post_json(url: str, payload: Dict[str, Any], timeout: float):
     return requests.post(url, json=payload, timeout=timeout)
 
-# ==========================
 # Polling de /metrics (opcional)
-# ==========================
 def _poll_metrics_loop(session_id: str):
     """Hilo que sondea /metrics en cada nodo (sin CPU/RAM en vivo en el agent)."""
     logger.info(f"[{session_id}] Iniciando poll de /metrics")
@@ -153,17 +137,8 @@ def _poll_metrics_loop(session_id: str):
         time.sleep(METRICS_POLL_INTERVAL)
     logger.info(f"[{session_id}] Fin de poll de /metrics")
 
-# ==========================
 # Loop de entrenamiento por rondas (FedAvg)
-# ==========================
-def _train_fedavg_loop(session_id: str,
-                       nodes: List[str],
-                       epochs: int,
-                       init_b64: str,
-                       lr: float, momentum: float, weight_decay: float,
-                       seed: int,
-                       shards_per_epoch: int,
-                       hp_defaults: Dict[str, Any]):
+def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64: str, lr: float, momentum: float, weight_decay: float, seed: int, shards_per_epoch: int, hp_defaults: Dict[str, Any]):
     try:
         logger.info(f"[{session_id}] Iniciando FedAvg: epochs={epochs}, shards_per_epoch={shards_per_epoch}, nodes={nodes}")
         current_b64 = init_b64
@@ -299,9 +274,6 @@ def _train_fedavg_loop(session_id: str,
         SESSIONS[session_id]["status"] = "failed"
         SESSIONS[session_id]["running"] = False
 
-# ==========================
-# Endpoints HTTP
-# ==========================
 @app.route("/train", methods=["POST"])
 def start_train():
     """
@@ -522,9 +494,6 @@ def list_nodes():
             }
     return jsonify({"nodes": node_status})
 
-# ==========================
-# Errores HTTP
-# ==========================
 @app.errorhandler(404)
 def not_found(err):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -533,9 +502,6 @@ def not_found(err):
 def internal_error(err):
     return jsonify({"error": "Internal server error"}), 500
 
-# ==========================
-# Main
-# ==========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "6001"))
     logger.info(f"Iniciando controller en 0.0.0.0:{port}")
