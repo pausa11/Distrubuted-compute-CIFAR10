@@ -34,7 +34,7 @@ NODE_HOSTS = {
 }
 
 # Timeouts / intervalos
-HTTP_TIMEOUT_TRAIN = float(os.environ.get("HTTP_TIMEOUT_TRAIN", "120"))  # s por /train_batch
+HTTP_TIMEOUT_TRAIN = float(os.environ.get("HTTP_TIMEOUT_TRAIN", "400"))  # s por /train_batch
 HTTP_TIMEOUT_PING  = float(os.environ.get("HTTP_TIMEOUT_PING", "2"))     # s para /health
 HTTP_TIMEOUT_METR  = float(os.environ.get("HTTP_TIMEOUT_METR", "1.5"))   # s para /metrics
 SSE_HEARTBEAT_EVERY = 10  # iteraciones (~0.5s * 10 = 5s aprox)
