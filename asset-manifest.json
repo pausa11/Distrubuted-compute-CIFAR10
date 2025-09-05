@@ -1,15 +1,15 @@
 {
   "files": {
-    "main.css": "/Distrubuted-compute-CIFAR10/static/css/main.53801f6d.css",
-    "main.js": "/Distrubuted-compute-CIFAR10/static/js/main.fd0cc62a.js",
+    "main.css": "/Distrubuted-compute-CIFAR10/static/css/main.1cd3e67b.css",
+    "main.js": "/Distrubuted-compute-CIFAR10/static/js/main.a540e315.js",
     "static/js/453.cba5cdfe.chunk.js": "/Distrubuted-compute-CIFAR10/static/js/453.cba5cdfe.chunk.js",
     "index.html": "/Distrubuted-compute-CIFAR10/index.html",
-    "main.53801f6d.css.map": "/Distrubuted-compute-CIFAR10/static/css/main.53801f6d.css.map",
-    "main.fd0cc62a.js.map": "/Distrubuted-compute-CIFAR10/static/js/main.fd0cc62a.js.map",
+    "main.1cd3e67b.css.map": "/Distrubuted-compute-CIFAR10/static/css/main.1cd3e67b.css.map",
+    "main.a540e315.js.map": "/Distrubuted-compute-CIFAR10/static/js/main.a540e315.js.map",
     "453.cba5cdfe.chunk.js.map": "/Distrubuted-compute-CIFAR10/static/js/453.cba5cdfe.chunk.js.map"
   },
   "entrypoints": [
-    "static/css/main.53801f6d.css",
-    "static/js/main.fd0cc62a.js"
+    "static/css/main.1cd3e67b.css",
+    "static/js/main.a540e315.js"
   ]
 }
