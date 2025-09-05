@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 
 const NODES = [
-  { id: "node-0", host: "192.168.20.3" },
-  { id: "node-1", host: "10.128.0.6" },
-  { id: "node-2", host: "10.128.0.7" },
-  { id: "node-3", host: "10.128.0.8" },
-  { id: "node-4", host: "10.128.0.9" },
+  { id: "node-0", host: "34.132.166.106" },
+  { id: "node-1", host: "34.121.35.52" },
+  { id: "node-2", host: "34.9.209.76" },
+  { id: "node-3", host: "34.53.3.174" },
+  { id: "node-4", host: "34.11.238.13" },
 ];
 
-const API_BASE = "http://192.168.20.3:6001";
+const API_BASE = "http://34.135.213.57:6001";
 
 export default function App() {
   const [selected, setSelected] = useState([NODES[0].id]);

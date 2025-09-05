@@ -27,10 +27,10 @@ logger = logging.getLogger("controller")
 # Ajusta aquí los hosts de tus nodos (agents)
 NODE_HOSTS = {
     "node-0": "http://34.132.166.106:6000",
-    "node-1": "http://192.168.20.3:6002",
-    "node-2": "http://192.168.20.3:6003",
-    "node-3": "http://192.168.20.3:6004",
-    "node-4": "http://192.168.20.3:6005",
+    "node-1": "http://34.121.35.52:6000",
+    "node-2": "http://34.9.209.76:6000",
+    "node-3": "http://34.53.3.174:6000",
+    "node-4": "http://34.11.238.13:6000",
 }
 
 # Timeouts / intervalos
