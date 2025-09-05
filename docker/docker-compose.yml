@@ -1,0 +1,25 @@
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: cifar10-trainer
+    command: >
+      python train.py
+      --epochs 5
+      --batch-size 128
+      --lr 0.1
+      --momentum 0.9
+      --weight-decay 0.0005
+      --workers 0
+      --cpu
+      --data /data
+      --checkpoints /app/checkpoints
+      --seed 1337
+      --device auto
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./data:/data
+      - ./checkpoints:/app/checkpoints
+    tty: true
