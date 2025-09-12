@@ -43,6 +43,10 @@ DEFAULT_ONECYCLE        = os.environ.get("DEFAULT_ONECYCLE", "1") == "1"
 DEFAULT_CLIP_GRAD_NORM  = float(os.environ.get("DEFAULT_CLIP_GRAD_NORM", "1.0"))
 DEFAULT_NESTEROV        = os.environ.get("DEFAULT_NESTEROV", "1") == "1"
 
+# === Config opcional para ruta de checkpoints ===
+CHECKPOINTS_DIR = os.environ.get("CHECKPOINTS_DIR", "./checkpoints")
+BEST_CKPT_NAME = os.environ.get("BEST_CKPT_NAME", "best.pt")
+
 # Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -104,6 +108,17 @@ def fedavg_state_dicts(sd_list: List[Dict[str, torch.Tensor]], weights: List[int
 
 def post_json(url: str, payload: Dict[str, Any], timeout: float):
     return requests.post(url, json=payload, timeout=timeout)
+
+def _resolve_best_ckpt_path() -> str:
+    # 1) ruta absoluta estándar
+    abs_path = "/checkpoints/best.pt"
+    if os.path.isfile(abs_path):
+        return abs_path
+    # 2) ruta configurable/relativa
+    rel_path = os.path.join(CHECKPOINTS_DIR, BEST_CKPT_NAME)
+    if os.path.isfile(rel_path):
+        return rel_path
+    return ""
 
 # Polling de /metrics (opcional)
 def _poll_metrics_loop(session_id: str):
@@ -491,6 +506,38 @@ def list_nodes():
                 "last_check": time.time()
             }
     return jsonify({"nodes": node_status})
+
+@app.route("/best_model", methods=["GET"])
+def get_best_model():
+    try:
+        ckpt_path = _resolve_best_ckpt_path()
+        if not ckpt_path:
+            return jsonify({"ok": False, "error": "best.pt not found"}), 404
+
+        obj = torch.load(ckpt_path, map_location="cpu")
+
+        # tu checkpoint guarda el state_dict en 'model_state'
+        if "model_state" in obj:
+            state_dict = obj["model_state"]
+        else:
+            return jsonify({"ok": False, "error": f"Formato desconocido: {list(obj.keys())}"}), 400
+
+        b64 = state_to_b64(state_dict)
+        stat = os.stat(ckpt_path)
+
+        return jsonify({
+            "ok": True,
+            "model_state_b64": b64,
+            "info": {
+                "path": ckpt_path,
+                "size_bytes": stat.st_size,
+                "updated_at": stat.st_mtime,
+                "extra": {k: obj[k] for k in obj if k != "model_state"}  # val_acc, epoch
+            }
+        })
+    except Exception as e:
+        logger.exception("Error en /best_model")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(err):
