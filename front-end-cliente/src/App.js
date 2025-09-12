@@ -40,6 +40,51 @@ export default function App() {
     const es = new EventSource(`${API_BASE}/events/${sessionId}`);
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 5;
+
+    const handlePayload = (payload) => {
+      if (!payload || typeof payload !== "object") return;
+      const nodeId = payload.node_id || "all";
+      // actualizar métricas visibles
+      setStats((prev) => ({
+        ...prev,
+        [nodeId]: {
+          ...(prev[nodeId] || {}),
+          ...payload
+        }
+      }));
+
+      // calcular progreso
+      const totalEpochsNum = Number(epochs) || 1;
+      const epochNum = payload.epoch !== undefined ? Number(payload.epoch) : null;
+      let progressPct = 0;
+
+      if (payload.progress !== undefined) {
+        // payload.progress expected 0..1 dentro de la época actual
+        if (epochNum !== null) {
+          progressPct = ((epochNum - 1 + Number(payload.progress)) / totalEpochsNum) * 100;
+        } else {
+          progressPct = Number(payload.progress) * 100;
+        }
+      } else if (payload.batch !== undefined && payload.batches !== undefined) {
+        // fallback usando batch/batches
+        progressPct = ((Number(payload.batch) / Math.max(1, Number(payload.batches))) * 100);
+        // si también hay epoch, escalamos a totalEpochs
+        if (epochNum !== null) {
+          progressPct = ((epochNum - 1) / totalEpochsNum) * 100 + (progressPct / totalEpochsNum);
+        }
+      } else if (epochNum !== null) {
+        progressPct = (epochNum / totalEpochsNum) * 100;
+      }
+
+      setTrainingProgress(prev => ({
+        ...prev,
+        [nodeId]: {
+          epoch: epochNum ?? (prev[nodeId]?.epoch ?? 0),
+          totalEpochs: totalEpochsNum,
+          progress: Math.min(Math.max(progressPct, 0), 100)
+        }
+      }));
+    };
     
     es.onopen = (event) => {
       console.log("SSE conectado exitosamente");
@@ -49,32 +94,23 @@ export default function App() {
     };
 
     es.onmessage = (e) => {
+      // mensajes sin "event:" explícito
       try {
         const payload = JSON.parse(e.data);
-        console.log("Datos SSE recibidos:", payload);
-        
-        if (payload.node_id && payload.node_id !== "all") {
-          setStats((prev) => ({
-            ...prev,
-            [payload.node_id]: payload
-          }));
-          
-          if (payload.epoch) {
-            setTrainingProgress(prev => ({
-              ...prev,
-              [payload.node_id]: {
-                epoch: payload.epoch,
-                totalEpochs: epochs,
-                progress: (payload.epoch / epochs) * 100
-              }
-            }));
-          }
-        }
+        handlePayload(payload);
       } catch (err) {
-        console.error("Error parsing SSE data:", err);
-        setError(`Error procesando datos: ${err.message}`);
+        console.error("Error parsing SSE data (onmessage):", err);
       }
     };
+
+    es.addEventListener('metrics', (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        handlePayload(payload);
+      } catch (err) {
+        console.error("Error parsing metrics event:", err);
+      }
+    });
 
     es.addEventListener('connected', (e) => {
       console.log("Evento SSE: connected");
@@ -89,21 +125,7 @@ export default function App() {
     });
 
     es.addEventListener('heartbeat', (e) => {
-      // Mantener conexión viva
-    });
-
-    es.addEventListener('metrics', (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if (payload.node_id) {
-          setStats((prev) => ({
-            ...prev,
-            [payload.node_id]: payload
-          }));
-        }
-      } catch (err) {
-        console.error("Error parsing metrics event:", err);
-      }
+      // mantener vivo, no hace falta procesar payload
     });
 
     es.onerror = (event) => {
@@ -171,6 +193,13 @@ export default function App() {
       
       setStats({});
       setTrainingProgress({});
+
+      // Inicializar barra de progreso (época 0 -> 0%)
+      const initialProgress = { all: { epoch: 0, totalEpochs: Number(epochs), progress: 0 } };
+      selected.forEach(id => {
+        initialProgress[id] = { epoch: 0, totalEpochs: Number(epochs), progress: 0 };
+      });
+      setTrainingProgress(initialProgress);
       
       connectSSE(data.session_id);
       
@@ -289,7 +318,7 @@ export default function App() {
               max="1000"
               className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               value={epochs} 
-              onChange={(e) => setEpochs(e.target.value)}
+              onChange={(e) => setEpochs(Number(e.target.value))}
               disabled={!canModifySettings}
             />
           </div>
@@ -303,7 +332,7 @@ export default function App() {
               step="32" 
               className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               value={batchPerProc} 
-              onChange={(e) => setBatchPerProc(e.target.value)}
+              onChange={(e) => setBatchPerProc(Number(e.target.value))}
               disabled={!canModifySettings}
             />
           </div>
@@ -333,6 +362,25 @@ export default function App() {
               Sesión: {session.substring(0, 8)}...
             </div>
           </div>
+
+          {/* Barra de progreso global */}
+          {trainingProgress.all && (
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-sm font-medium text-gray-700">Global</div>
+                <div className="text-sm text-gray-600">{trainingProgress.all.epoch}/{trainingProgress.all.totalEpochs}</div>
+              </div>
+              <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
+                <div
+                  className="bg-blue-600 h-4 rounded-full transition-all duration-500 ease-out"
+                  style={{ width: `${Math.min(trainingProgress.all.progress, 100)}%` }}
+                />
+              </div>
+              <div className="text-right text-sm text-gray-600 mt-1">
+                {trainingProgress.all.progress.toFixed(1)}%
+              </div>
+            </div>
+          )}
           
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {selected.map((nodeId) => {
@@ -347,9 +395,22 @@ export default function App() {
                       </span>
                     )}
                   </div>
-                  {progress && (
-                    <div className="w-full bg-gray-200 rounded-full h-2">
-                      <div className="bg-blue-600 h-2 rounded-full transition-all duration-300" style={{ width: `${Math.min(progress.progress, 100)}%` }} />
+                  
+                  {progress ? (
+                    <div>
+                      <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                        <div
+                          className="bg-blue-600 h-3 rounded-full transition-all duration-500 ease-out"
+                          style={{ width: `${Math.min(progress.progress, 100)}%` }}
+                        />
+                      </div>
+                      <div className="text-right text-sm text-gray-600 mt-1">
+                        {progress.progress.toFixed(1)}%
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                      <div className="bg-gray-400 h-3 animate-pulse" style={{ width: "20%" }} />
                     </div>
                   )}
                 </div>
@@ -358,6 +419,7 @@ export default function App() {
           </div>
         </section>
       )}
+
 
       <section className="bg-white rounded-lg shadow p-6">
         <h2 className="text-xl font-semibold mb-4">Métricas en Tiempo Real</h2>
