@@ -11,6 +11,7 @@ const NODES = [
 const API_BASE = "https://sms-adequate-attention-intervals.trycloudflare.com";
 
 export default function App() {
+
   const [selected, setSelected] = useState([NODES[0].id]);
   const [epochs, setEpochs] = useState(25);
   const [batchPerProc, setBatchPerProc] = useState(128);
@@ -258,12 +259,7 @@ export default function App() {
         <h2 className="text-xl font-semibold mb-4">Configuración de Nodos</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {NODES.map((n) => (
-            <label 
-              key={n.id} 
-              className={`flex items-center gap-3 p-4 border rounded-lg cursor-pointer transition-colors ${
-                selected.includes(n.id) ? "border-blue-500 bg-blue-50" : "border-gray-200"
-              } ${!canModifySettings ? "opacity-50 cursor-not-allowed" : "hover:border-gray-300"}`}
-            >
+            <label key={n.id} className={`flex items-center gap-3 p-4 border rounded-lg cursor-pointer transition-colors ${ selected.includes(n.id) ? "border-blue-500 bg-blue-50" : "border-gray-200" } ${!canModifySettings ? "opacity-50 cursor-not-allowed" : "hover:border-gray-300"}`} >
               <input
                 type="checkbox"
                 checked={selected.includes(n.id)}
@@ -313,25 +309,15 @@ export default function App() {
           </div>
           <div className="flex items-end">
             {sessionStatus === "idle" || sessionStatus === "completed" || sessionStatus === "failed" ? (
-              <button 
-                onClick={startTraining}
-                disabled={selected.length === 0}
-                className="w-full bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
+              <button onClick={startTraining} disabled={selected.length === 0} className="w-full bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors" >
                 Iniciar Entrenamiento
               </button>
             ) : sessionStatus === "starting" ? (
-              <button 
-                disabled
-                className="w-full bg-gray-400 text-white px-4 py-2 rounded-lg cursor-not-allowed"
-              >
+              <button disabled className="w-full bg-gray-400 text-white px-4 py-2 rounded-lg cursor-not-allowed" >
                 Iniciando...
               </button>
             ) : (
-              <button 
-                onClick={stopTraining}
-                className="w-full bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors"
-              >
+              <button onClick={stopTraining} className="w-full bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors" >
                 Detener Entrenamiento
               </button>
             )}
@@ -363,10 +349,7 @@ export default function App() {
                   </div>
                   {progress && (
                     <div className="w-full bg-gray-200 rounded-full h-2">
-                      <div 
-                        className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                        style={{ width: `${Math.min(progress.progress, 100)}%` }}
-                      ></div>
+                      <div className="bg-blue-600 h-2 rounded-full transition-all duration-300" style={{ width: `${Math.min(progress.progress, 100)}%` }} />
                     </div>
                   )}
                 </div>
@@ -387,9 +370,7 @@ export default function App() {
               <div key={id} className="border border-gray-200 rounded-lg p-4 bg-gray-50">
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="font-semibold text-lg">{id}</h3>
-                  <div className={`w-3 h-3 rounded-full ${
-                    hasData ? "bg-green-500" : "bg-gray-400"
-                  }`}></div>
+                  <div className={`w-3 h-3 rounded-full ${ hasData ? "bg-green-500" : "bg-gray-400" }`}/>
                 </div>
                 
                 {hasData ? (

@@ -2,7 +2,6 @@ import os
 import io
 import math
 import base64
-import json
 import time
 import random
 import logging
@@ -19,9 +18,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import psutil
 
-# ==========================
-# Config global (RAM/CPU)
-# ==========================
 # Permitimos ajustar hilos vía ENV (por defecto 1 para estabilidad en VMs)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -42,22 +38,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("agent")
 logging.getLogger("werkzeug").setLevel(logging.WARNING)  # menos ruido HTTP
 
-# Flask
 app = Flask(__name__)
 
-# ==========================
-# Globals controlados
-# ==========================
 _init_lock = threading.Lock()
 _initialized = False
 
 _batch_manager: Optional["BatchManager"] = None
 _model: Optional[nn.Module] = None
-_device = torch.device("cpu")  # CPU por defecto
+_device = torch.device("cpu")
 
-# ==========================
-# Modelo (idéntico al del controller y a tu script)
-# ==========================
 class SmallCIFAR(nn.Module):
     """
     CNN para CIFAR-10 con BatchNorm y Dropout.
@@ -84,10 +73,7 @@ class SmallCIFAR(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x)
         return x
-
-# ==========================
-# Dataset / BatchManager (lazy)
-# ==========================
+    
 class BatchManager:
     """
     Carga CIFAR-10 on-demand.
@@ -179,9 +165,6 @@ class BatchManager:
         end_idx = (batch_id + 1) * samples_per_batch if batch_id < total_batches - 1 else total_samples
         return list(range(start_idx, end_idx))
 
-# ==========================
-# Utils
-# ==========================
 def set_seed(seed: int = 1337):
     random.seed(seed)
     np.random.seed(seed)
@@ -253,21 +236,7 @@ def evaluate_batch(model: nn.Module, loader: DataLoader, device: torch.device) -
         total += labels.size(0)
     return (total_loss / total) if total else 0.0, (correct / total) if total else 0.0
 
-# ==========================
-# Entrenamiento (replica tu script)
-# ==========================
-def train_one_batch(
-    model: nn.Module,
-    loader: DataLoader,
-    lr: float,
-    momentum: float,
-    weight_decay: float,
-    local_epochs: int = 1,
-    onecycle: bool = True,
-    clip_grad_norm: float = 1.0,
-    nesterov: bool = True,
-    device: torch.device = torch.device("cpu"),
-) -> Dict[str, Any]:
+def train_one_batch( model: nn.Module, loader: DataLoader, lr: float, momentum: float, weight_decay: float, local_epochs: int = 1, onecycle: bool = True, clip_grad_norm: float = 1.0, nesterov: bool = True, device: torch.device = torch.device("cpu"), ) -> Dict[str, Any]:
     model.train()
     criterion = nn.CrossEntropyLoss()
 
@@ -364,9 +333,6 @@ def train_one_batch(
         },
     }
 
-# ==========================
-# Endpoints
-# ==========================
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "message": "Node is running"}), 200
@@ -529,9 +495,6 @@ def metrics_endpoint():
         logger.exception("Error en /metrics")
         return jsonify({"error": str(e)}), 500
 
-# ==========================
-# Main
-# ==========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "6000"))
     logger.info(f"Iniciando agent en 0.0.0.0:{port}")
