@@ -6,16 +6,14 @@ import uuid
 import base64
 import logging
 import threading
-from typing import Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor
-
 import requests
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("controller")
