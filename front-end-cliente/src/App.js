@@ -10,6 +10,34 @@ const NODES = [
 
 const API_BASE = "https://sms-adequate-attention-intervals.trycloudflare.com";
 
+function PredictionCard({ item }) {
+  const { image, label_name, predictions } = item;
+  return (
+    <div className="border rounded-lg overflow-hidden bg-white">
+      <img
+        src={image}
+        alt={label_name}
+        className="w-full h-40 object-contain bg-gray-50"
+      />
+      <div className="p-3">
+        <div className="text-xs text-gray-500">Etiqueta real</div>
+        <div className="font-semibold mb-2">{label_name}</div>
+        <div className="text-xs text-gray-500 mb-1">Top-K</div>
+        <ul className="text-sm space-y-1">
+          {predictions.map((p, i) => (
+            <li key={i} className="flex justify-between">
+              <span>{p.class_name}</span>
+              <span className="tabular-nums">
+                {(p.prob * 100).toFixed(2)}%
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [selected, setSelected] = useState([NODES[0].id]);
   const [epochs, setEpochs] = useState(25);
@@ -26,6 +54,19 @@ export default function App() {
   const [bestModelB64, setBestModelB64] = useState(null);
   const [bestModelInfo, setBestModelInfo] = useState(null);
   const [bestLoading, setBestLoading] = useState(false);
+
+  // --- NUEVO: Predicciones aleatorias CIFAR-10 ---
+  const [samples, setSamples] = useState([]);
+  const [predLoading, setPredLoading] = useState(false);
+  const [predCount, setPredCount] = useState(12);
+  const [predTopK, setPredTopK] = useState(5);
+
+  // --- NUEVO: Predicción por imagen subida ---
+  const [uploadPreview, setUploadPreview] = useState(null);
+  const [uploadPreds, setUploadPreds] = useState(null); // respuesta completa del backend
+  const [uploadTopK, setUploadTopK] = useState(5);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const fileInputRef = useRef(null);
 
   const toggleNode = (id) => {
     if (sessionStatus === "running") return;
@@ -115,7 +156,10 @@ export default function App() {
           console.log("SSE connection closed");
           setConnectionStatus("disconnected");
 
-          if (sessionStatus === "running" && reconnectAttempts < maxReconnectAttempts) {
+          if (
+            sessionStatus === "running" &&
+            reconnectAttempts < maxReconnectAttempts
+          ) {
             reconnectAttempts++;
             console.log(
               `Reintentando conexión SSE (${reconnectAttempts}/${maxReconnectAttempts})...`
@@ -127,7 +171,9 @@ export default function App() {
               }
             }, 2000 * reconnectAttempts);
           } else if (reconnectAttempts >= maxReconnectAttempts) {
-            setError("No se pudo restablecer la conexión con el servidor. Recarga la página.");
+            setError(
+              "No se pudo restablecer la conexión con el servidor. Recarga la página."
+            );
             setConnectionStatus("failed");
           }
         } else {
@@ -216,7 +262,8 @@ export default function App() {
   function base64ToBlob(base64) {
     const byteChars = atob(base64);
     const byteNumbers = new Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+    for (let i = 0; i < byteChars.length; i++)
+      byteNumbers[i] = byteChars.charCodeAt(i);
     const byteArray = new Uint8Array(byteNumbers);
     return new Blob([byteArray], { type: "application/octet-stream" });
   }
@@ -234,8 +281,10 @@ export default function App() {
 
       let meta = { ...(data.info || {}) };
       if (data.info?.extra) {
-        if (typeof data.info.extra.val_acc !== "undefined") meta.val_acc = data.info.extra.val_acc;
-        if (typeof data.info.extra.epoch !== "undefined") meta.epoch = data.info.extra.epoch;
+        if (typeof data.info.extra.val_acc !== "undefined")
+          meta.val_acc = data.info.extra.val_acc;
+        if (typeof data.info.extra.epoch !== "undefined")
+          meta.epoch = data.info.extra.epoch;
       }
       setBestModelInfo(meta);
     } catch (e) {
@@ -269,13 +318,73 @@ export default function App() {
     }
   }, [bestModelB64]);
 
+  // ----- NUEVO: Obtener muestras aleatorias -----
+  const fetchRandomPreds = useCallback(async () => {
+    setPredLoading(true);
+    setError(null);
+    try {
+      const url = `${API_BASE}/predict_random?count=${predCount}&topk=${predTopK}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      setSamples(data.items || []);
+    } catch (e) {
+      setError(`No se pudieron obtener predicciones: ${e.message}`);
+      setSamples([]);
+    } finally {
+      setPredLoading(false);
+    }
+  }, [predCount, predTopK]);
+
+  // ----- NUEVO: Manejo de upload imagen -----
+  const handleFileChange = (e) => {
+    const f = e.target.files?.[0];
+    setUploadPreds(null);
+    if (!f) {
+      setUploadPreview(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => setUploadPreview(ev.target.result);
+    reader.readAsDataURL(f);
+  };
+
+  const predictFromFile = useCallback(async () => {
+    if (!fileInputRef.current?.files?.[0]) {
+      setError("Selecciona una imagen primero.");
+      return;
+    }
+    setUploadLoading(true);
+    setError(null);
+    try {
+      const fd = new FormData();
+      fd.append("image", fileInputRef.current.files[0]);
+      const res = await fetch(
+        `${API_BASE}/predict_image?topk=${uploadTopK}`,
+        { method: "POST", body: fd }
+      );
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      setUploadPreds(data); // { image, predictions, topk, ts }
+    } catch (e) {
+      setError(`No se pudo predecir la imagen: ${e.message}`);
+      setUploadPreds(null);
+    } finally {
+      setUploadLoading(false);
+    }
+  }, [uploadTopK]);
+
   const isTrainingActive = ["starting", "running"].includes(sessionStatus);
   const canModifySettings = !isTrainingActive;
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
       <header className="border-b pb-4">
-        <h1 className="text-3xl font-bold text-gray-900">Sistema de Cómputo Distribuido</h1>
+        <h1 className="text-3xl font-bold text-gray-900">
+          Sistema de Cómputo Distribuido
+        </h1>
         <div className="flex items-center gap-4 mt-2">
           <div className="flex items-center gap-2">
             <div
@@ -290,7 +399,9 @@ export default function App() {
               }`}
             ></div>
             <span className="text-sm text-gray-600">
-              {connectionStatus === "reconnecting" ? "Reconectando..." : `Conexión: ${connectionStatus}`}
+              {connectionStatus === "reconnecting"
+                ? "Reconectando..."
+                : `Conexión: ${connectionStatus}`}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -314,7 +425,10 @@ export default function App() {
         <div className="bg-red-50 border border-red-200 rounded-lg p-4">
           <div className="flex">
             <div className="text-red-600 text-sm">{error}</div>
-            <button onClick={() => setError(null)} className="ml-auto text-red-600 hover:text-red-800">
+            <button
+              onClick={() => setError(null)}
+              className="ml-auto text-red-600 hover:text-red-800"
+            >
               ×
             </button>
           </div>
@@ -328,8 +442,14 @@ export default function App() {
             <label
               key={n.id}
               className={`flex items-center gap-3 p-4 border rounded-lg cursor-pointer transition-colors ${
-                selected.includes(n.id) ? "border-blue-500 bg-blue-50" : "border-gray-200"
-              } ${!canModifySettings ? "opacity-50 cursor-not-allowed" : "hover:border-gray-300"}`}
+                selected.includes(n.id)
+                  ? "border-blue-500 bg-blue-50"
+                  : "border-gray-200"
+              } ${
+                !canModifySettings
+                  ? "opacity-50 cursor-not-allowed"
+                  : "hover:border-gray-300"
+              }`}
             >
               <input
                 type="checkbox"
@@ -351,7 +471,9 @@ export default function App() {
         <h2 className="text-xl font-semibold mb-4">Hiperparámetros</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Epochs</label>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Epochs
+            </label>
             <input
               type="number"
               min="1"
@@ -363,7 +485,9 @@ export default function App() {
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Batch por proceso</label>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Batch por proceso
+            </label>
             <input
               type="number"
               min="32"
@@ -375,7 +499,9 @@ export default function App() {
             />
           </div>
           <div className="flex items-end">
-            {sessionStatus === "idle" || sessionStatus === "completed" || sessionStatus === "failed" ? (
+            {sessionStatus === "idle" ||
+            sessionStatus === "completed" ||
+            sessionStatus === "failed" ? (
               <button
                 onClick={startTraining}
                 disabled={selected.length === 0}
@@ -384,7 +510,10 @@ export default function App() {
                 Iniciar Entrenamiento
               </button>
             ) : sessionStatus === "starting" ? (
-              <button disabled className="w-full bg-gray-400 text-white px-4 py-2 rounded-lg cursor-not-allowed">
+              <button
+                disabled
+                className="w-full bg-gray-400 text-white px-4 py-2 rounded-lg cursor-not-allowed"
+              >
                 Iniciando...
               </button>
             ) : (
@@ -403,7 +532,9 @@ export default function App() {
         <section className="bg-white rounded-lg shadow p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold">Progreso del Entrenamiento</h2>
-            <div className="text-sm text-gray-600">Sesión: {session.substring(0, 8)}...</div>
+            <div className="text-sm text-gray-600">
+              Sesión: {session.substring(0, 8)}...
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -445,7 +576,11 @@ export default function App() {
               <div key={id} className="border border-gray-200 rounded-lg p-4 bg-gray-50">
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="font-semibold text-lg">{id}</h3>
-                  <div className={`w-3 h-3 rounded-full ${hasData ? "bg-green-500" : "bg-gray-400"}`} />
+                  <div
+                    className={`w-3 h-3 rounded-full ${
+                      hasData ? "bg-green-500" : "bg-gray-400"
+                    }`}
+                  />
                 </div>
 
                 {hasData ? (
@@ -453,11 +588,21 @@ export default function App() {
                     <div className="grid grid-cols-2 gap-4">
                       <div className="bg-white rounded p-2">
                         <div className="text-xs text-gray-500">CPU</div>
-                        <div className="text-lg font-medium">{s.cpu?.toFixed?.(1) ?? 0}%</div>
+                        <div className="text-lg font-medium">
+                          {s.cpu?.toFixed?.(1) ??
+                            s.avg_cpu_pct?.toFixed?.(1) ??
+                            0}
+                          %
+                        </div>
                       </div>
                       <div className="bg-white rounded p-2">
                         <div className="text-xs text-gray-500">RAM</div>
-                        <div className="text-lg font-medium">{s.ram?.toFixed?.(1) ?? 0}%</div>
+                        <div className="text-lg font-medium">
+                          {s.ram?.toFixed?.(1) ??
+                            s.peak_ram_pct?.toFixed?.(1) ??
+                            0}
+                          %
+                        </div>
                       </div>
                     </div>
 
@@ -468,17 +613,22 @@ export default function App() {
                       </div>
                       <div className="bg-white rounded p-2 text-center">
                         <div className="text-xs text-gray-500">Loss</div>
-                        <div className="font-medium">{s.loss?.toFixed?.(4) ?? "-"}</div>
+                        <div className="font-medium">
+                          {s.loss?.toFixed?.(4) ?? "-"}
+                        </div>
                       </div>
                       <div className="bg-white rounded p-2 text-center">
                         <div className="text-xs text-gray-500">Acc</div>
-                        <div className="font-medium">{s.acc?.toFixed?.(2) ?? "-"}%</div>
+                        <div className="font-medium">
+                          {s.acc?.toFixed?.(2) ?? "-"}%
+                        </div>
                       </div>
                     </div>
 
                     {s.ts && (
                       <div className="text-xs text-gray-500 text-center pt-2 border-t">
-                        Última actualización: {new Date(s.ts * 1000).toLocaleTimeString()}
+                        Última actualización:{" "}
+                        {new Date(s.ts * 1000).toLocaleTimeString()}
                       </div>
                     )}
                   </div>
@@ -534,7 +684,9 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
             <div className="bg-gray-50 p-3 rounded border">
               <div className="text-gray-500">Ruta</div>
-              <div className="font-medium break-all">{bestModelInfo.path || "-"}</div>
+              <div className="font-medium break-all">
+                {bestModelInfo.path || "-"}
+              </div>
             </div>
             <div className="bg-gray-50 p-3 rounded border">
               <div className="text-gray-500">Tamaño</div>
@@ -569,12 +721,116 @@ export default function App() {
             <div className="bg-gray-50 p-3 rounded border md:col-span-3">
               <div className="text-gray-500">Estado</div>
               <div className="font-medium">
-                {bestModelB64 ? "Modelo cargado (base64 listo para usar)" : "Aún no cargado"}
+                {bestModelB64
+                  ? "Modelo cargado (base64 listo para usar)"
+                  : "Aún no cargado"}
               </div>
             </div>
           </div>
         ) : (
           <div className="text-gray-500">Aún no has solicitado el modelo.</div>
+        )}
+      </section>
+
+      {/* === NUEVO: Probar modelo con CIFAR-10 (aleatorio) === */}
+      <section className="bg-white rounded-lg shadow p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-semibold">Probar modelo con CIFAR-10</h2>
+          <div className="flex gap-2">
+            <input
+              type="number"
+              min="1"
+              max="64"
+              value={predCount}
+              onChange={(e) => setPredCount(Number(e.target.value))}
+              className="w-24 border border-gray-300 rounded px-2 py-1"
+              disabled={predLoading}
+              title="Número de muestras"
+            />
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={predTopK}
+              onChange={(e) => setPredTopK(Number(e.target.value))}
+              className="w-24 border border-gray-300 rounded px-2 py-1"
+              disabled={predLoading}
+              title="Top-K"
+            />
+            <button
+              onClick={fetchRandomPreds}
+              className="bg-emerald-600 text-white px-4 py-2 rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+              disabled={predLoading}
+            >
+              {predLoading ? "Cargando..." : "Obtener muestras"}
+            </button>
+          </div>
+        </div>
+
+        {samples.length === 0 ? (
+          <div className="text-gray-500">Aún no has solicitado predicciones.</div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            {samples.map((it, idx) => (
+              <PredictionCard key={idx} item={it} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* === NUEVO: Probar con una imagen subida === */}
+      <section className="bg-white rounded-lg shadow p-6">
+        <h2 className="text-xl font-semibold mb-4">Probar con una imagen</h2>
+
+        <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
+          <div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFileChange}
+              className="block w-full text-sm text-gray-700 file:mr-3 file:py-2 file:px-3 file:rounded file:border-0 file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200"
+            />
+            {uploadPreview && (
+              <img
+                src={uploadPreview}
+                alt="preview"
+                className="mt-2 w-32 h-32 object-contain border rounded bg-gray-50"
+              />
+            )}
+          </div>
+
+          <div className="flex gap-2 items-center">
+            <label className="text-sm text-gray-700">Top-K</label>
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={uploadTopK}
+              onChange={(e) => setUploadTopK(Number(e.target.value))}
+              className="w-24 border border-gray-300 rounded px-2 py-1"
+              disabled={uploadLoading}
+            />
+            <button
+              onClick={predictFromFile}
+              className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              disabled={uploadLoading || !fileInputRef.current}
+            >
+              {uploadLoading ? "Prediciendo..." : "Predecir imagen"}
+            </button>
+          </div>
+        </div>
+
+        {uploadPreds && (
+          <div className="mt-6">
+            <PredictionCard
+              item={{
+                image: uploadPreds.image,
+                label_name: "Entrada",
+                predictions: uploadPreds.predictions || [],
+              }}
+            />
+          </div>
         )}
       </section>
     </div>

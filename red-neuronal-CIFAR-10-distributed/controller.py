@@ -10,10 +10,14 @@ import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+
+# ==== NUEVO: PIL / torchvision para inferencia y visualización ====
+from PIL import Image
+from torchvision import datasets, transforms
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("controller")
@@ -89,6 +93,7 @@ def state_to_b64(sd: Dict[str, torch.Tensor]) -> str:
 def b64_to_state(b64s: str) -> Dict[str, torch.Tensor]:
     raw = base64.b64decode(b64s.encode("ascii"))
     bio = io.BytesIO(raw)
+    # weights_only=True requiere PyTorch >= 2.2; si usas <2.2, puedes quitar el flag.
     return torch.load(bio, map_location="cpu", weights_only=True)
 
 def fedavg_state_dicts(sd_list: List[Dict[str, torch.Tensor]], weights: List[int]) -> Dict[str, torch.Tensor]:
@@ -110,7 +115,7 @@ def post_json(url: str, payload: Dict[str, Any], timeout: float):
     return requests.post(url, json=payload, timeout=timeout)
 
 def _resolve_best_ckpt_path() -> str:
-    # 1) ruta absoluta estándar
+    # 1) ruta absoluta estándar (por ejemplo si montaste /checkpoints)
     abs_path = "/checkpoints/best.pt"
     if os.path.isfile(abs_path):
         return abs_path
@@ -120,7 +125,9 @@ def _resolve_best_ckpt_path() -> str:
         return rel_path
     return ""
 
-# Polling de /metrics (opcional)
+# =========================
+#  Polling de /metrics (opcional)
+# =========================
 def _poll_metrics_loop(session_id: str):
     """Hilo que sondea /metrics en cada nodo (sin CPU/RAM en vivo en el agent)."""
     logger.info(f"[{session_id}] Iniciando poll de /metrics")
@@ -150,7 +157,9 @@ def _poll_metrics_loop(session_id: str):
         time.sleep(METRICS_POLL_INTERVAL)
     logger.info(f"[{session_id}] Fin de poll de /metrics")
 
-# Loop de entrenamiento por rondas (FedAvg)
+# =========================
+#  Loop de entrenamiento por rondas (FedAvg)
+# =========================
 def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64: str, lr: float, momentum: float, weight_decay: float, seed: int, shards_per_epoch: int, hp_defaults: Dict[str, Any]):
     try:
         logger.info(f"[{session_id}] Iniciando FedAvg: epochs={epochs}, shards_per_epoch={shards_per_epoch}, nodes={nodes}")
@@ -178,7 +187,6 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
                         if not base:
                             continue
 
-                        # Payload con hiperparámetros "estilo script bueno"
                         payload = {
                             "batch_id": batch_id,
                             "total_batches": total_batches,
@@ -291,24 +299,6 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
 def start_train():
     """
     Inicia una sesión de entrenamiento orquestado (FedAvg).
-
-    Body JSON (overrides opcionales de defaults):
-    {
-      "nodes": ["node-0","node-1",...],
-      "epochs": 25,
-      "lr": 0.1,
-      "momentum": 0.9,
-      "weight_decay": 0.0005,
-      "seed": 1337,
-      "shards_per_epoch": 1,
-
-      "local_epochs": 1,
-      "batch_size": 256,
-      "workers": 8,
-      "onecycle": true,
-      "clip_grad_norm": 1.0,
-      "nesterov": true
-    }
     """
     try:
         p = request.get_json(force=True) or {}
@@ -532,12 +522,229 @@ def get_best_model():
                 "path": ckpt_path,
                 "size_bytes": stat.st_size,
                 "updated_at": stat.st_mtime,
-                "extra": {k: obj[k] for k in obj if k != "model_state"}  # val_acc, epoch
+                "extra": {k: obj[k] for k in obj if k != "model_state"}  # val_acc, epoch, etc.
             }
         })
     except Exception as e:
         logger.exception("Error en /best_model")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# ======================================================
+# ============== NUEVO: INFERENCIA =====================
+# ======================================================
+
+# Clases de CIFAR-10
+CIFAR10_CLASSES = [
+    "airplane","automobile","bird","cat","deer",
+    "dog","frog","horse","ship","truck"
+]
+
+# Mean/STD estándar de CIFAR-10 (asegúrate que coincidan con tu training)
+_CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
+_CIFAR_STD  = (0.2470, 0.2435, 0.2616)
+
+# Recursos cacheados para inferencia
+_infer_model: Optional[nn.Module] = None
+_test_ds = None
+_test_tf = None
+_denorm_tf = None
+_last_best_mtime: Optional[float] = None
+
+def _best_path_and_mtime() -> Tuple[str, float]:
+    ckpt = _resolve_best_ckpt_path()
+    if not ckpt or not os.path.isfile(ckpt):
+        raise FileNotFoundError("best.pt not found (revisa CHECKPOINTS_DIR / BEST_CKPT_NAME)")
+    return ckpt, os.path.getmtime(ckpt)
+
+def _ensure_infer_resources():
+    """Carga (o recarga) el modelo best.pt y el dataset de test con sus transforms."""
+    global _infer_model, _test_ds, _test_tf, _denorm_tf, _last_best_mtime
+
+    # Dataset + transforms
+    if _test_ds is None:
+        _test_tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD),
+        ])
+        # Denormalización para visualizar
+        _denorm_tf = transforms.Normalize(
+            mean=tuple(-m/s for m, s in zip(_CIFAR_MEAN, _CIFAR_STD)),
+            std=tuple(1/s for s in _CIFAR_STD)
+        )
+        _test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=_test_tf)
+
+    # Modelo
+    ckpt, mtime = _best_path_and_mtime()
+    if (_infer_model is None) or (_last_best_mtime != mtime):
+        logger.info(f"Cargando modelo de {ckpt} ...")
+        _last_best_mtime = mtime
+        obj = torch.load(ckpt, map_location="cpu")
+        if "model_state" not in obj:
+            raise RuntimeError(f"Checkpoint sin 'model_state': keys={list(obj.keys())}")
+
+        net = SmallCIFAR(num_classes=10).cpu()
+        missing, unexpected = net.load_state_dict(obj["model_state"], strict=False)
+        if missing:
+            logger.warning(f"Faltan llaves al cargar state_dict: {missing}")
+        if unexpected:
+            logger.warning(f"Llaves inesperadas al cargar state_dict: {unexpected}")
+        net.eval()
+        _infer_model = net
+
+def _tensor_to_png_datauri(x_norm: torch.Tensor) -> str:
+    """
+    x_norm: tensor [3,32,32] normalizado. Devuelve PNG base64 data URI.
+    """
+    with torch.no_grad():
+        x = _denorm_tf(x_norm.cpu())
+        x = torch.clamp(x, 0.0, 1.0)
+        img = (x.permute(1,2,0).numpy() * 255).astype("uint8")
+        pil = Image.fromarray(img)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+def _image_to_tensor(img: Image.Image) -> torch.Tensor:
+    """
+    Acepta PIL.Image; la convierte a RGB, redimensiona a 32x32 y normaliza como CIFAR-10.
+    """
+    img = img.convert("RGB").resize((32, 32), Image.BILINEAR)
+    t = transforms.ToTensor()(img)
+    t = transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD)(t)
+    return t
+
+@app.route("/predict_random", methods=["GET"])
+def predict_random():
+    """
+    Devuelve muestras aleatorias del test de CIFAR-10 con predicciones top-k.
+    Query params:
+      - count: int (1..64)  default 12
+      - topk:  int (1..10)  default 5
+    """
+    try:
+        _ensure_infer_resources()
+    except Exception as e:
+        logger.exception("Error preparando recursos de inferencia:")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    try:
+        count = int(request.args.get("count", "12"))
+        topk  = int(request.args.get("topk", "5"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "Parámetros inválidos"}), 400
+
+    count = max(1, min(count, 64))
+    topk  = max(1, min(topk, 10))
+
+    import random
+    idxs = random.sample(range(len(_test_ds)), count)
+    items = []
+
+    with torch.no_grad():
+        for idx in idxs:
+            x_norm, y_true = _test_ds[idx]  # x_norm: [3,32,32] normalizado
+            logits = _infer_model(x_norm.unsqueeze(0))  # [1,10]
+            probs  = F.softmax(logits, dim=1)[0]        # [10]
+
+            pvals, pidxs = torch.topk(probs, k=topk)
+            preds = [{
+                "class_index": int(ci),
+                "class_name": CIFAR10_CLASSES[ci],
+                "prob": float(p)
+            } for p, ci in zip(pvals.tolist(), pidxs.tolist())]
+
+            items.append({
+                "image": _tensor_to_png_datauri(x_norm),
+                "label_index": int(y_true),
+                "label_name": CIFAR10_CLASSES[y_true],
+                "predictions": preds
+            })
+
+    return jsonify({
+        "ok": True,
+        "count": len(items),
+        "items": items,
+        "ts": int(time.time())
+    })
+
+@app.route("/predict_image", methods=["POST"])
+def predict_image():
+    """
+    Recibe una imagen y devuelve top-k predicciones.
+    Formas de envío:
+      - multipart/form-data con campo 'image'
+      - application/json con campo 'image_b64' -> "data:image/...;base64,...." o sólo base64 puro
+    Query param:
+      - topk: int (1..10), default 5
+    """
+    try:
+        _ensure_infer_resources()
+    except Exception as e:
+        logger.exception("Error preparando recursos de inferencia:")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    try:
+        topk = int(request.args.get("topk", "5"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "Parámetro topk inválido"}), 400
+    topk = max(1, min(topk, 10))
+
+    pil_img = None
+
+    # 1) multipart
+    if "image" in request.files:
+        f = request.files["image"]
+        try:
+            pil_img = Image.open(f.stream)
+        except Exception:
+            return jsonify({"ok": False, "error": "No se pudo abrir la imagen"}), 400
+
+    # 2) JSON base64
+    elif request.is_json:
+        data = request.get_json(silent=True) or {}
+        b64s = data.get("image_b64")
+        if not b64s:
+            return jsonify({"ok": False, "error": "Falta image_b64"}), 400
+        # soporta 'data:image/png;base64,....'
+        if "," in b64s:
+            b64s = b64s.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(b64s)
+            pil_img = Image.open(io.BytesIO(raw))
+        except Exception:
+            return jsonify({"ok": False, "error": "Base64 inválido o imagen corrupta"}), 400
+    else:
+        return jsonify({"ok": False, "error": "Provee 'image' (multipart) o 'image_b64' (JSON)"}), 400
+
+    # Preproceso y predicción
+    x_norm = _image_to_tensor(pil_img)  # [3,32,32]
+    with torch.no_grad():
+        logits = _infer_model(x_norm.unsqueeze(0))  # [1,10]
+        probs  = F.softmax(logits, dim=1)[0]        # [10]
+        pvals, pidxs = torch.topk(probs, k=topk)
+
+    preds = [{
+        "class_index": int(ci),
+        "class_name": CIFAR10_CLASSES[ci],
+        "prob": float(p)
+    } for p, ci in zip(pvals.tolist(), pidxs.tolist())]
+
+    # Para visualización del input (ya reescalado a 32x32)
+    # Convertimos x_norm a data URI
+    data_uri = _tensor_to_png_datauri(x_norm)
+
+    return jsonify({
+        "ok": True,
+        "topk": topk,
+        "predictions": preds,
+        "image": data_uri,
+        "ts": int(time.time())
+    })
+
+# ======================================================
+# ================== FIN INFERENCIA ====================
+# ======================================================
 
 @app.errorhandler(404)
 def not_found(err):
