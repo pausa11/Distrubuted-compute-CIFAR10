@@ -14,10 +14,9 @@ from typing import Dict, Any, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-
-# ==== NUEVO: PIL / torchvision para inferencia y visualización ====
 from PIL import Image
 from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 logger = logging.getLogger("controller")
@@ -47,44 +46,62 @@ DEFAULT_ONECYCLE        = os.environ.get("DEFAULT_ONECYCLE", "1") == "1"
 DEFAULT_CLIP_GRAD_NORM  = float(os.environ.get("DEFAULT_CLIP_GRAD_NORM", "1.0"))
 DEFAULT_NESTEROV        = os.environ.get("DEFAULT_NESTEROV", "1") == "1"
 
-# === Config opcional para ruta de checkpoints ===
+# Checkpoints
 CHECKPOINTS_DIR = os.environ.get("CHECKPOINTS_DIR", "./checkpoints")
-BEST_CKPT_NAME = os.environ.get("BEST_CKPT_NAME", "best.pt")
+BEST_CKPT_NAME  = os.environ.get("BEST_CKPT_NAME", "best.pt")
 
-# Flask app
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# Modelo (igual al de los nodos)
-class SmallCIFAR(nn.Module):
-    def __init__(self, num_classes: int = 10):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
-        self.bn1   = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, 3, padding=1, groups=1)
-        self.bn2   = nn.BatchNorm2d(64)
-        self.pool  = nn.MaxPool2d(2, 2)
-        self.conv3 = nn.Conv2d(64, 128, 3, padding=1, groups=1)
-        self.bn3   = nn.BatchNorm2d(128)
-        self.fc1   = nn.Linear(128 * 4 * 4, 256)
-        self.dropout = nn.Dropout(0.5)
-        self.fc2   = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 32x16x16
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 64x8x8
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))  # 128x4x4
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+# Evaluación
+EVAL_ON_TEST = os.environ.get("EVAL_ON_TEST", "1") == "1"
+TEST_EVAL_BATCH_SIZE = int(os.environ.get("TEST_EVAL_BATCH_SIZE", "256"))
 
 # Estado global en memoria
 SESSIONS: Dict[str, Dict[str, Any]] = {}   # session_id -> info
 METRICS:  Dict[str, Dict[str, Dict[str, Any]]] = {}  # session_id -> { node_id: last_metrics }
 
-# Utils: (de)serialización & agregación
+# Clases de CIFAR-10
+CIFAR10_CLASSES = [ "airplane","automobile","bird","cat","deer", "dog","frog","horse","ship","truck" ]
+
+# Mean/STD estándar de CIFAR-10 (asegúrate que coincidan con tu training)
+_CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
+_CIFAR_STD  = (0.2470, 0.2435, 0.2616)
+
+# Recursos cacheados para inferencia/evaluación
+_infer_model: Optional[nn.Module] = None
+_test_ds = None
+_test_tf = None
+_denorm_tf = None
+_last_best_mtime: Optional[float] = None
+
+# Flask app
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+#   Modelo (igual a nodos)
+class SmallCIFAR(nn.Module):
+  def __init__(self, num_classes: int = 10):
+      super().__init__()
+      self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+      self.bn1   = nn.BatchNorm2d(32)
+      self.conv2 = nn.Conv2d(32, 64, 3, padding=1, groups=1)
+      self.bn2   = nn.BatchNorm2d(64)
+      self.pool  = nn.MaxPool2d(2, 2)
+      self.conv3 = nn.Conv2d(64, 128, 3, padding=1, groups=1)
+      self.bn3   = nn.BatchNorm2d(128)
+      self.fc1   = nn.Linear(128 * 4 * 4, 256)
+      self.dropout = nn.Dropout(0.5)
+      self.fc2   = nn.Linear(256, num_classes)
+
+  def forward(self, x):
+      x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 32x16x16
+      x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 64x8x8
+      x = self.pool(F.relu(self.bn3(self.conv3(x))))  # 128x4x4
+      x = x.view(x.size(0), -1)
+      x = F.relu(self.fc1(x))
+      x = self.dropout(x)
+      x = self.fc2(x)
+      return x
+
+# Utils
 def state_to_b64(sd: Dict[str, torch.Tensor]) -> str:
     bio = io.BytesIO()
     torch.save(sd, bio)
@@ -93,7 +110,7 @@ def state_to_b64(sd: Dict[str, torch.Tensor]) -> str:
 def b64_to_state(b64s: str) -> Dict[str, torch.Tensor]:
     raw = base64.b64decode(b64s.encode("ascii"))
     bio = io.BytesIO(raw)
-    # weights_only=True requiere PyTorch >= 2.2; si usas <2.2, puedes quitar el flag.
+    # Nota: weights_only=True requiere PyTorch >= 2.2; en <2.2 quitar el flag.
     return torch.load(bio, map_location="cpu", weights_only=True)
 
 def fedavg_state_dicts(sd_list: List[Dict[str, torch.Tensor]], weights: List[int]) -> Dict[str, torch.Tensor]:
@@ -111,23 +128,149 @@ def fedavg_state_dicts(sd_list: List[Dict[str, torch.Tensor]], weights: List[int
             out[k] = acc.to(sd_list[0][k].dtype)
     return out
 
-def post_json(url: str, payload: Dict[str, Any], timeout: float):
-    return requests.post(url, json=payload, timeout=timeout)
-
 def _resolve_best_ckpt_path() -> str:
-    # 1) ruta absoluta estándar (por ejemplo si montaste /checkpoints)
+    """Devuelve ruta existente a best.pt si existe; si no, cadena vacía."""
     abs_path = "/checkpoints/best.pt"
     if os.path.isfile(abs_path):
         return abs_path
-    # 2) ruta configurable/relativa
     rel_path = os.path.join(CHECKPOINTS_DIR, BEST_CKPT_NAME)
     if os.path.isfile(rel_path):
         return rel_path
     return ""
 
-# =========================
-#  Polling de /metrics (opcional)
-# =========================
+def _best_save_path() -> str:
+    """Ruta donde GUARDAR best.pt. Prefiere /checkpoints si existe, si no CHECKPOINTS_DIR."""
+    if os.path.isdir("/checkpoints"):
+        os.makedirs("/checkpoints", exist_ok=True)
+        return "/checkpoints/best.pt"
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    return os.path.join(CHECKPOINTS_DIR, BEST_CKPT_NAME)
+
+def _best_path_and_mtime() -> Tuple[str, float]:
+    ckpt = _resolve_best_ckpt_path()
+    if not ckpt or not os.path.isfile(ckpt):
+        raise FileNotFoundError("best.pt not found (revisa CHECKPOINTS_DIR / BEST_CKPT_NAME)")
+    return ckpt, os.path.getmtime(ckpt)
+
+def _load_disk_best_meta() -> Tuple[float, int]:
+    """Lee val_acc y epoch del best.pt en disco. Si no existe, (-inf, -1)."""
+    p = _resolve_best_ckpt_path()
+    if not p:
+        return float("-inf"), -1
+    try:
+        obj = torch.load(p, map_location="cpu")
+        val_acc = float(obj.get("val_acc", float("-inf")))
+        epoch   = int(obj.get("epoch", -1))
+        return val_acc, epoch
+    except Exception as e:
+        logger.warning(f"No se pudo leer meta de best.pt existente: {e}")
+        return float("-inf"), -1
+
+def _atomic_save_best(state_dict: Dict[str, torch.Tensor], epoch: int, val_acc: float, session_id: str):
+    """Guarda best.pt de forma atómica."""
+    target = _best_save_path()
+    tmp = target + ".tmp"
+    payload = {
+        "model_state": state_dict,
+        "epoch": int(epoch),
+        "val_acc": float(val_acc),    # en porcentaje
+        "updated_at": time.time(),
+        "session_id": session_id
+    }
+    torch.save(payload, tmp)
+    os.replace(tmp, target)
+    logger.info(f"[BEST] Guardado nuevo best.pt en '{target}' (epoch={epoch}, val_acc={val_acc:.2f}%)")
+
+# Inferencia / evaluación
+def _ensure_infer_resources():
+    """Carga (o recarga) el modelo best.pt y el dataset de test con sus transforms."""
+    global _infer_model, _test_ds, _test_tf, _denorm_tf, _last_best_mtime
+
+    # Dataset + transforms
+    if _test_ds is None:
+        _test_tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD),
+        ])
+        # Denormalización para visualizar
+        _denorm_tf = transforms.Normalize(
+            mean=tuple(-m/s for m, s in zip(_CIFAR_MEAN, _CIFAR_STD)),
+            std=tuple(1/s for s in _CIFAR_STD)
+        )
+        _test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=_test_tf)
+
+    # Modelo
+    ckpt, mtime = _best_path_and_mtime()
+    if (_infer_model is None) or (_last_best_mtime != mtime):
+        logger.info(f"Cargando modelo de {ckpt} ...")
+        _last_best_mtime = mtime
+        obj = torch.load(ckpt, map_location="cpu")
+        if "model_state" not in obj:
+            raise RuntimeError(f"Checkpoint sin 'model_state': keys={list(obj.keys())}")
+
+        net = SmallCIFAR(num_classes=10).cpu()
+        missing, unexpected = net.load_state_dict(obj["model_state"], strict=False)
+        if missing:
+            logger.warning(f"Faltan llaves al cargar state_dict: {missing}")
+        if unexpected:
+            logger.warning(f"Llaves inesperadas al cargar state_dict: {unexpected}")
+        net.eval()
+        _infer_model = net
+
+def _evaluate_state_dict_on_test(state_dict: Dict[str, torch.Tensor]) -> float:
+    """
+    Evalúa accuracy (%) en CIFAR-10 test con CPU.
+    """
+    # Asegura dataset
+    if _test_ds is None:
+        _ensure_infer_resources()
+    # Construye red y carga pesos
+    model = SmallCIFAR(num_classes=10).cpu()
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        logger.debug(f"[EVAL] faltan llaves: {missing}")
+    if unexpected:
+        logger.debug(f"[EVAL] llaves inesperadas: {unexpected}")
+    model.eval()
+
+    loader = DataLoader(_test_ds, batch_size=TEST_EVAL_BATCH_SIZE, shuffle=False, num_workers=0)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in loader:
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total   += y.numel()
+    acc = 100.0 * correct / max(1, total)
+    return acc
+
+def _tensor_to_png_datauri(x_norm: torch.Tensor) -> str:
+    """
+    x_norm: tensor [3,32,32] normalizado. Devuelve PNG base64 data URI.
+    """
+    with torch.no_grad():
+        x = _denorm_tf(x_norm.cpu())
+        x = torch.clamp(x, 0.0, 1.0)
+        img = (x.permute(1,2,0).numpy() * 255).astype("uint8")
+        pil = Image.fromarray(img)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+
+def _image_to_tensor(img: Image.Image) -> torch.Tensor:
+    """
+    Acepta PIL.Image; la convierte a RGB, redimensiona a 32x32 y normaliza como CIFAR-10.
+    """
+    img = img.convert("RGB").resize((32, 32), Image.BILINEAR)
+    t = transforms.ToTensor()(img)
+    t = transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD)(t)
+    return t
+
+def post_json(url: str, payload: Dict[str, Any], timeout: float):
+    return requests.post(url, json=payload, timeout=timeout)
+
+# Métricas polling opcional
 def _poll_metrics_loop(session_id: str):
     """Hilo que sondea /metrics en cada nodo (sin CPU/RAM en vivo en el agent)."""
     logger.info(f"[{session_id}] Iniciando poll de /metrics")
@@ -157,14 +300,20 @@ def _poll_metrics_loop(session_id: str):
         time.sleep(METRICS_POLL_INTERVAL)
     logger.info(f"[{session_id}] Fin de poll de /metrics")
 
-# =========================
-#  Loop de entrenamiento por rondas (FedAvg)
-# =========================
-def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64: str, lr: float, momentum: float, weight_decay: float, seed: int, shards_per_epoch: int, hp_defaults: Dict[str, Any]):
+#  Loop de entrenamiento (FedAvg)
+def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64: str,
+                       lr: float, momentum: float, weight_decay: float, seed: int,
+                       shards_per_epoch: int, hp_defaults: Dict[str, Any]):
     try:
         logger.info(f"[{session_id}] Iniciando FedAvg: epochs={epochs}, shards_per_epoch={shards_per_epoch}, nodes={nodes}")
         current_b64 = init_b64
         total_batches = max(1, len(nodes) * max(1, shards_per_epoch))
+
+        # Mejor en disco (si existe)
+        best_acc_disk, best_epoch_disk = _load_disk_best_meta()
+        best_acc = best_acc_disk
+        best_epoch = best_epoch_disk
+        logger.info(f"[{session_id}] best.pt en disco: epoch={best_epoch} val_acc={best_acc if best_acc!=float('-inf') else 'N/A'}")
 
         for epoch in range(1, epochs + 1):
             if not SESSIONS.get(session_id, {}).get("running", False):
@@ -216,7 +365,7 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
                                 raise RuntimeError(f"HTTP {r.status_code}")
                             resp = r.json()
 
-                            # Registrar métricas + recursos del nodo (sin /metrics en vivo)
+                            # Registrar métricas + recursos del nodo
                             METRICS.setdefault(session_id, {}).setdefault(node_id, {})
                             res = resp.get("resources", {}) or {}
                             METRICS[session_id][node_id].update({
@@ -232,7 +381,7 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
                                 "ts": time.time(),
                                 "node_id": node_id,
 
-                                # Para trazabilidad de HP usados en el agent
+                                # HP usados en el agent
                                 "local_epochs": hp_defaults["local_epochs"],
                                 "onecycle": hp_defaults["onecycle"],
                                 "clip_grad_norm": hp_defaults["clip_grad_norm"],
@@ -259,6 +408,7 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
 
                     wsum = float(sum(weights))
                     sub_loss = sum(w * float(m["loss"]) for w, m in zip(weights, pernode)) / wsum
+                    # m["accuracy"] viene en [0..1] desde los agentes, aquí lo pasamos a %
                     sub_acc  = 100.0 * sum(w * float(m["accuracy"]) for w, m in zip(weights, pernode)) / wsum
                     epoch_loss_accumulator.append((sub_loss, wsum))
                     epoch_acc_accumulator.append((sub_acc,  wsum))
@@ -272,6 +422,7 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
                         "node_id": "all"
                     }
 
+            # Métricas agregadas por epoch (promedio ponderado)
             if epoch_loss_accumulator:
                 total_w = sum(epoch_weight_accumulator)
                 g_loss = sum(l * w for (l, w) in epoch_loss_accumulator) / total_w
@@ -286,7 +437,28 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
                 "ts": time.time(),
                 "node_id": "all"
             }
-            logger.info(f"[{session_id}] Epoch {epoch}/{epochs}: loss={g_loss:.4f} acc={g_acc:.2f}%")
+            logger.info(f"[{session_id}] Epoch {epoch}/{epochs}: loss={g_loss:.4f} acc(train)={g_acc:.2f}%")
+
+            #   GUARDAR BEST.PT
+            # 1) Reconstruimos state_dict actual para evaluar / guardar
+            current_sd = b64_to_state(current_b64)
+
+            # 2) val_acc: test o proxy de train
+            if EVAL_ON_TEST:
+                try:
+                    val_acc = _evaluate_state_dict_on_test(current_sd)
+                    logger.info(f"[{session_id}] Epoch {epoch}: val_acc(test)={val_acc:.2f}%")
+                except Exception as e:
+                    logger.exception(f"[{session_id}] Error evaluando en test; usando acc(train) como proxy.")
+                    val_acc = float(g_acc)
+            else:
+                val_acc = float(g_acc)
+
+            # 3) Si mejora, guardamos best.pt
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_epoch = epoch
+                _atomic_save_best(current_sd, epoch, val_acc, session_id)
 
         SESSIONS[session_id]["status"] = "completed"
         SESSIONS[session_id]["running"] = False
@@ -295,6 +467,7 @@ def _train_fedavg_loop(session_id: str, nodes: List[str], epochs: int, init_b64:
         SESSIONS[session_id]["status"] = "failed"
         SESSIONS[session_id]["running"] = False
 
+#  Endpoints
 @app.route("/train", methods=["POST"])
 def start_train():
     """
@@ -522,97 +695,12 @@ def get_best_model():
                 "path": ckpt_path,
                 "size_bytes": stat.st_size,
                 "updated_at": stat.st_mtime,
-                "extra": {k: obj[k] for k in obj if k != "model_state"}  # val_acc, epoch, etc.
+                "extra": {k: obj[k] for k in obj if k != "model_state"}  # val_acc, epoch, session_id, updated_at...
             }
         })
     except Exception as e:
         logger.exception("Error en /best_model")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-# ======================================================
-# ============== NUEVO: INFERENCIA =====================
-# ======================================================
-
-# Clases de CIFAR-10
-CIFAR10_CLASSES = [
-    "airplane","automobile","bird","cat","deer",
-    "dog","frog","horse","ship","truck"
-]
-
-# Mean/STD estándar de CIFAR-10 (asegúrate que coincidan con tu training)
-_CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
-_CIFAR_STD  = (0.2470, 0.2435, 0.2616)
-
-# Recursos cacheados para inferencia
-_infer_model: Optional[nn.Module] = None
-_test_ds = None
-_test_tf = None
-_denorm_tf = None
-_last_best_mtime: Optional[float] = None
-
-def _best_path_and_mtime() -> Tuple[str, float]:
-    ckpt = _resolve_best_ckpt_path()
-    if not ckpt or not os.path.isfile(ckpt):
-        raise FileNotFoundError("best.pt not found (revisa CHECKPOINTS_DIR / BEST_CKPT_NAME)")
-    return ckpt, os.path.getmtime(ckpt)
-
-def _ensure_infer_resources():
-    """Carga (o recarga) el modelo best.pt y el dataset de test con sus transforms."""
-    global _infer_model, _test_ds, _test_tf, _denorm_tf, _last_best_mtime
-
-    # Dataset + transforms
-    if _test_ds is None:
-        _test_tf = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD),
-        ])
-        # Denormalización para visualizar
-        _denorm_tf = transforms.Normalize(
-            mean=tuple(-m/s for m, s in zip(_CIFAR_MEAN, _CIFAR_STD)),
-            std=tuple(1/s for s in _CIFAR_STD)
-        )
-        _test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=_test_tf)
-
-    # Modelo
-    ckpt, mtime = _best_path_and_mtime()
-    if (_infer_model is None) or (_last_best_mtime != mtime):
-        logger.info(f"Cargando modelo de {ckpt} ...")
-        _last_best_mtime = mtime
-        obj = torch.load(ckpt, map_location="cpu")
-        if "model_state" not in obj:
-            raise RuntimeError(f"Checkpoint sin 'model_state': keys={list(obj.keys())}")
-
-        net = SmallCIFAR(num_classes=10).cpu()
-        missing, unexpected = net.load_state_dict(obj["model_state"], strict=False)
-        if missing:
-            logger.warning(f"Faltan llaves al cargar state_dict: {missing}")
-        if unexpected:
-            logger.warning(f"Llaves inesperadas al cargar state_dict: {unexpected}")
-        net.eval()
-        _infer_model = net
-
-def _tensor_to_png_datauri(x_norm: torch.Tensor) -> str:
-    """
-    x_norm: tensor [3,32,32] normalizado. Devuelve PNG base64 data URI.
-    """
-    with torch.no_grad():
-        x = _denorm_tf(x_norm.cpu())
-        x = torch.clamp(x, 0.0, 1.0)
-        img = (x.permute(1,2,0).numpy() * 255).astype("uint8")
-        pil = Image.fromarray(img)
-        buf = io.BytesIO()
-        pil.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        return f"data:image/png;base64,{b64}"
-
-def _image_to_tensor(img: Image.Image) -> torch.Tensor:
-    """
-    Acepta PIL.Image; la convierte a RGB, redimensiona a 32x32 y normaliza como CIFAR-10.
-    """
-    img = img.convert("RGB").resize((32, 32), Image.BILINEAR)
-    t = transforms.ToTensor()(img)
-    t = transforms.Normalize(_CIFAR_MEAN, _CIFAR_STD)(t)
-    return t
 
 @app.route("/predict_random", methods=["GET"])
 def predict_random():
@@ -731,7 +819,6 @@ def predict_image():
     } for p, ci in zip(pvals.tolist(), pidxs.tolist())]
 
     # Para visualización del input (ya reescalado a 32x32)
-    # Convertimos x_norm a data URI
     data_uri = _tensor_to_png_datauri(x_norm)
 
     return jsonify({
@@ -741,10 +828,6 @@ def predict_image():
         "image": data_uri,
         "ts": int(time.time())
     })
-
-# ======================================================
-# ================== FIN INFERENCIA ====================
-# ======================================================
 
 @app.errorhandler(404)
 def not_found(err):
